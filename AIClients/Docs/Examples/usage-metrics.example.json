@@ -1,0 +1,10 @@
+{
+  "providerName": "OpenAI",
+  "modelName": "gpt-4o",
+  "promptTokens": 128,
+  "completionTokens": 256,
+  "totalTokens": 384,
+  "tokensPerSecond": 75.3,
+  "timeToFirstToken": "00:00:00.4200000",
+  "totalResponseTime": "00:00:03.4000000"
+}

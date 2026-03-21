@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AiLibrarySettings",
+  "type": "object",
+  "required": ["defaultProvider", "providers"],
+  "properties": {
+    "defaultProvider": { "type": "string" },
+    "timeoutSeconds": { "type": "integer", "minimum": 1 },
+    "loggingVerbosity": { "type": "string" },
+    "retryPolicy": {
+      "type": "object",
+      "properties": {
+        "maxAttempts": { "type": "integer", "minimum": 1 },
+        "baseDelayMilliseconds": { "type": "integer", "minimum": 0 },
+        "circuitBreakerEnabled": { "type": "boolean" },
+        "circuitBreakerFailureThreshold": { "type": "integer", "minimum": 1 },
+        "circuitBreakerDurationSeconds": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["providerType", "defaults"],
+        "properties": {
+          "providerType": { "type": "string" },
+          "apiKey": { "type": ["string", "null"] },
+          "baseUrl": { "type": ["string", "null"] },
+          "streamingEnabled": { "type": "boolean" },
+          "enableReasoning": { "type": "boolean" },
+          "localModelPath": { "type": ["string", "null"] },
+          "defaults": {
+            "type": "object",
+            "required": ["model"],
+            "properties": {
+              "model": { "type": "string" },
+              "temperature": { "type": "number" },
+              "maxTokens": { "type": "integer", "minimum": 1 },
+              "topP": { "type": "number" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

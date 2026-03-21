@@ -1,0 +1,40 @@
+{
+  "defaultProvider": "OpenAI",
+  "timeoutSeconds": 120,
+  "loggingVerbosity": "Information",
+  "retryPolicy": {
+    "maxAttempts": 3,
+    "baseDelayMilliseconds": 250,
+    "circuitBreakerEnabled": true,
+    "circuitBreakerFailureThreshold": 5,
+    "circuitBreakerDurationSeconds": 30
+  },
+  "providers": {
+    "OpenAI": {
+      "providerType": "OpenAI",
+      "apiKey": "${OPENAI_API_KEY}",
+      "baseUrl": "https://api.openai.com/v1",
+      "streamingEnabled": true,
+      "enableReasoning": true,
+      "defaults": {
+        "model": "gpt-4o",
+        "temperature": 0.7,
+        "maxTokens": 2048,
+        "topP": 1.0
+      }
+    },
+    "LMStudio": {
+      "providerType": "Local",
+      "baseUrl": "http://localhost:1234/v1",
+      "streamingEnabled": true,
+      "enableReasoning": false,
+      "localModelPath": "models/",
+      "defaults": {
+        "model": "llama-3.1-8b-instruct",
+        "temperature": 0.6,
+        "maxTokens": 1024,
+        "topP": 0.95
+      }
+    }
+  }
+}

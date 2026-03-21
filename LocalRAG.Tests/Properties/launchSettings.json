@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "LocalRAG.Tests": {
+      "commandName": "Project",
+      "environmentVariables": {
+      }
+    }
+  }
+}

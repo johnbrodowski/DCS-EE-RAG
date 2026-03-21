@@ -1,0 +1,26 @@
+[
+  {
+    "role": 0,
+    "content": "You are a concise assistant.",
+    "timestamp": "2026-01-10T09:00:00+00:00",
+    "metadata": { "source": "system" },
+    "tokenUsage": null,
+    "model": "gpt-4o"
+  },
+  {
+    "role": 1,
+    "content": "Summarize event-driven design in one paragraph.",
+    "timestamp": "2026-01-10T09:00:04+00:00",
+    "metadata": { "requestId": "req-001" },
+    "tokenUsage": null,
+    "model": "gpt-4o"
+  },
+  {
+    "role": 2,
+    "content": "Event-driven design reacts to domain events asynchronously...",
+    "timestamp": "2026-01-10T09:00:05+00:00",
+    "metadata": { "final": "true" },
+    "tokenUsage": { "promptTokens": 22, "completionTokens": 31, "totalTokens": 53 },
+    "model": "gpt-4o"
+  }
+]

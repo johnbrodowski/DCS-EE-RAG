@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>AiMessagingCore</RootNamespace>
+    <AssemblyName>AiMessagingCore</AssemblyName>
+    <Description>Provider-neutral AI messaging library with streaming, context accumulation, and multi-provider support.</Description>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LLamaSharp" Version="0.21.0" />
+  </ItemGroup>
+
+</Project>

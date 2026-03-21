@@ -1,0 +1,305 @@
+{
+  "name": "EE-RAG Benchmark v1",
+  "version": "1.0",
+  "description": "Software engineering knowledge base for evaluating EE-RAG retrieval quality across Git, Python, SQL, REST, Docker, and testing domains.",
+  "knowledge_entries": [
+    {
+      "slug": "git-rebase-onto-main",
+      "request": "How do I rebase my feature branch onto the latest main?",
+      "text_response": "To rebase your feature branch onto the latest main, first fetch the latest changes: `git fetch origin`. Then rebase: `git rebase origin/main`. If conflicts occur, resolve them, stage the resolved files with `git add`, and continue with `git rebase --continue`. To abort, use `git rebase --abort`. If your branch contains merge commits, add the `--rebase-merges` flag to preserve them.",
+      "summary": "Rebase a feature branch: git fetch origin && git rebase origin/main. Use --rebase-merges if the branch has merge commits."
+    },
+    {
+      "slug": "git-stash-and-apply",
+      "request": "How do I stash uncommitted changes and apply them later?",
+      "text_response": "Use `git stash` to save your uncommitted changes to a temporary stack. To include untracked files, use `git stash -u`. List stashes with `git stash list`. Apply the most recent stash and keep it in the stack with `git stash apply`, or remove it while applying with `git stash pop`. To apply a specific stash, use `git stash apply stash@{2}`. Delete a stash with `git stash drop stash@{0}` or clear all with `git stash clear`.",
+      "summary": "git stash saves work-in-progress. git stash pop reapplies and removes the top stash. git stash list shows all stashes."
+    },
+    {
+      "slug": "git-cherry-pick",
+      "request": "How do I cherry-pick a specific commit onto my branch?",
+      "text_response": "Use `git cherry-pick <commit-hash>` to apply a specific commit from another branch onto your current branch. This creates a new commit with the same changes but a different hash. To cherry-pick a range of commits, use `git cherry-pick A..B` (exclusive of A) or `git cherry-pick A^..B` (inclusive). If conflicts arise, resolve them, then run `git cherry-pick --continue`. To abort, use `git cherry-pick --abort`. Add `-n` to apply changes without committing, letting you inspect or modify them first.",
+      "summary": "git cherry-pick <hash> applies a single commit to the current branch. Use A^..B for a range. Resolve conflicts then --continue."
+    },
+    {
+      "slug": "git-reset-hard",
+      "request": "How do I undo commits and reset my branch to a previous state?",
+      "text_response": "Use `git reset` to move the branch pointer. `git reset --soft HEAD~1` undoes the last commit but keeps changes staged. `git reset --mixed HEAD~1` (the default) undoes the commit and unstages changes but keeps the files. `git reset --hard HEAD~1` discards the commit and all working directory changes — this is destructive. To recover from an accidental hard reset, use `git reflog` to find the lost commit hash and `git reset --hard <hash>` to restore it. Never force-reset commits that have been pushed to a shared branch.",
+      "summary": "git reset --soft keeps changes staged; --mixed unstages them; --hard discards all changes. Recover with git reflog."
+    },
+    {
+      "slug": "git-merge-conflict-resolution",
+      "request": "How do I resolve a merge conflict in Git?",
+      "text_response": "When a merge conflict occurs, Git marks the conflicting sections in the affected files with `<<<<<<<`, `=======`, and `>>>>>>>` markers. Open the file, decide which changes to keep (yours, theirs, or a combination), and remove the markers. After editing, stage the resolved file with `git add <filename>`. Once all conflicts are resolved, complete the merge with `git commit`. You can also use `git mergetool` to launch a visual merge tool. To abort the merge entirely, use `git merge --abort`.",
+      "summary": "Resolve merge conflicts by editing conflict markers in files, then git add the resolved files, then git commit."
+    },
+    {
+      "slug": "python-async-await",
+      "request": "How do I use async and await in Python?",
+      "text_response": "Python's `asyncio` library enables asynchronous programming. Define a coroutine with `async def`. Inside it, use `await` before any coroutine or awaitable. Run the top-level coroutine with `asyncio.run(main())`. To run multiple tasks concurrently, use `asyncio.gather(task1(), task2())` which runs them in the same event loop and returns results as a list. Use `asyncio.create_task()` for fire-and-forget tasks. Avoid calling blocking I/O directly in async code — use async-compatible libraries like `aiohttp` or `aiofiles` instead.",
+      "summary": "Python async/await: define coroutines with async def, await awaitables, run with asyncio.run(). Use asyncio.gather for concurrency."
+    },
+    {
+      "slug": "python-list-comprehensions",
+      "request": "How do list comprehensions work in Python?",
+      "text_response": "A list comprehension provides a concise way to create lists. Syntax: `[expression for item in iterable if condition]`. Example: `[x**2 for x in range(10) if x % 2 == 0]` produces `[0, 4, 16, 36, 64]`. Nested comprehensions: `[x*y for x in range(3) for y in range(3)]`. For dictionaries, use `{k: v for k, v in pairs}`. For sets, use `{expr for item in iterable}`. Comprehensions are generally faster than equivalent `for` loops because they are optimized at the C level. Prefer generator expressions `(expr for ...)` when you only need to iterate once.",
+      "summary": "List comprehensions: [expr for item in iterable if cond]. Faster than loops. Use dict/set variants for mappings and sets."
+    },
+    {
+      "slug": "python-dataclasses",
+      "request": "How do I use dataclasses in Python?",
+      "text_response": "The `@dataclass` decorator (from `dataclasses` module) automatically generates `__init__`, `__repr__`, and `__eq__` methods. Declare fields with type annotations. Use `field(default_factory=list)` for mutable defaults. Frozen dataclasses (`@dataclass(frozen=True)`) are immutable and hashable. `@dataclass(order=True)` adds comparison methods. Use `__post_init__` for validation or derived fields. For optional fields with defaults, place them after required fields. Dataclasses can inherit from each other, but parent fields always come before child fields in `__init__`.",
+      "summary": "@dataclass auto-generates __init__, __repr__, __eq__. Use field(default_factory=...) for mutable defaults. frozen=True makes it immutable."
+    },
+    {
+      "slug": "python-context-managers",
+      "request": "How do I create and use context managers in Python?",
+      "text_response": "Context managers implement the `__enter__` and `__exit__` methods, used with the `with` statement. `with open('file.txt') as f:` is the canonical example — `__exit__` closes the file even if an exception occurs. To create your own, either implement a class with `__enter__`/`__exit__`, or use the `@contextmanager` decorator from `contextlib` with a generator: `yield` is where the `with` block executes; code after `yield` runs on exit. The `@contextmanager` approach handles exceptions if you wrap `yield` in `try/finally`. Use `contextlib.suppress(ExceptionType)` to silently ignore specific exceptions.",
+      "summary": "Context managers use __enter__/__exit__ with the with statement. Use @contextmanager decorator for generator-based context managers."
+    },
+    {
+      "slug": "python-decorators",
+      "request": "How do decorators work in Python?",
+      "text_response": "A decorator is a function that takes a function and returns a new function, allowing you to wrap or modify behavior. Apply with `@decorator_name` above the function definition. To preserve the original function's metadata, use `@functools.wraps(func)` inside your decorator. Decorators with arguments require an extra level of nesting: a factory function that returns the actual decorator. Class decorators are also possible — they receive the class and return a modified class. Common built-in decorators include `@property`, `@staticmethod`, `@classmethod`, and `@functools.lru_cache` for memoization.",
+      "summary": "Decorators wrap functions. Use @functools.wraps to preserve metadata. Decorators with arguments need a factory function returning the decorator."
+    },
+    {
+      "slug": "sql-joins",
+      "request": "What are the different types of SQL JOINs and when should I use each?",
+      "text_response": "SQL JOIN types: INNER JOIN returns only rows with matching values in both tables. LEFT JOIN returns all rows from the left table and matched rows from the right (NULLs for non-matches). RIGHT JOIN is the mirror of LEFT JOIN. FULL OUTER JOIN returns all rows from both tables. CROSS JOIN returns the Cartesian product. SELF JOIN joins a table to itself using aliases. Use INNER JOIN when you only want records that exist in both tables. Use LEFT JOIN to preserve all records from the primary table. Avoid CROSS JOIN on large tables — it produces n×m rows.",
+      "summary": "INNER JOIN: matching rows only. LEFT JOIN: all left rows. FULL OUTER JOIN: all rows from both sides. CROSS JOIN: Cartesian product."
+    },
+    {
+      "slug": "sql-indexes",
+      "request": "How do SQL indexes work and when should I create them?",
+      "text_response": "A database index is a data structure (typically a B-tree) that speeds up SELECT queries at the cost of slower writes and extra storage. Create an index on columns frequently used in WHERE, JOIN ON, or ORDER BY clauses. Composite indexes cover multiple columns — column order matters; the index is used for queries that filter on the leftmost prefix. A covering index includes all columns needed by a query so the engine never reads the table. Avoid over-indexing: each index adds overhead to INSERT, UPDATE, and DELETE. Use EXPLAIN or EXPLAIN ANALYZE to verify that a query uses the index you expect.",
+      "summary": "Indexes speed up reads but slow writes. Create on WHERE/JOIN/ORDER BY columns. Composite indexes use leftmost-prefix matching."
+    },
+    {
+      "slug": "sql-transactions",
+      "request": "How do database transactions and ACID properties work?",
+      "text_response": "A transaction groups one or more SQL statements into an atomic unit. ACID properties: Atomicity — all or nothing; if any statement fails, the whole transaction rolls back. Consistency — the database remains in a valid state before and after. Isolation — concurrent transactions appear serial; isolation levels (READ UNCOMMITTED, READ COMMITTED, REPEATABLE READ, SERIALIZABLE) trade off consistency for concurrency. Durability — committed changes survive crashes. Use `BEGIN; ... COMMIT;` or `BEGIN TRANSACTION; ... ROLLBACK;`. Savepoints allow partial rollbacks within a transaction: `SAVEPOINT sp1; ROLLBACK TO sp1;`.",
+      "summary": "Transactions are ACID: atomic, consistent, isolated, durable. BEGIN...COMMIT or ROLLBACK. Savepoints allow partial rollback."
+    },
+    {
+      "slug": "sql-upsert",
+      "request": "How do I perform an UPSERT (insert or update) in SQL?",
+      "text_response": "In PostgreSQL and SQLite, use `INSERT INTO ... ON CONFLICT (key) DO UPDATE SET col = EXCLUDED.col`. In MySQL, use `INSERT INTO ... ON DUPLICATE KEY UPDATE col = VALUES(col)` or the `REPLACE INTO` statement (which deletes then re-inserts). In SQL Server, use the `MERGE` statement with WHEN MATCHED THEN UPDATE and WHEN NOT MATCHED THEN INSERT clauses. SQLite-specific: `INSERT OR REPLACE INTO` replaces the row if the primary key conflicts. Always use the conflict-target clause to specify which unique constraint triggers the update.",
+      "summary": "UPSERT in PostgreSQL/SQLite: INSERT ... ON CONFLICT DO UPDATE. MySQL: ON DUPLICATE KEY UPDATE. SQL Server: MERGE statement."
+    },
+    {
+      "slug": "sql-ctes",
+      "request": "What are Common Table Expressions (CTEs) and how do I use them?",
+      "text_response": "A CTE (Common Table Expression) defines a named temporary result set using the `WITH` clause, making complex queries more readable. Syntax: `WITH cte_name AS (SELECT ...) SELECT * FROM cte_name`. Multiple CTEs: `WITH a AS (...), b AS (SELECT * FROM a ...) SELECT * FROM b`. Recursive CTEs iterate over hierarchical data: `WITH RECURSIVE cte AS (base_case UNION ALL recursive_step) SELECT * FROM cte`. Use CTEs instead of subqueries when the same result is referenced multiple times, or to break a complex query into named steps. CTEs are not materialized by default in all databases — PostgreSQL has a `MATERIALIZED` hint.",
+      "summary": "CTEs: WITH name AS (query) SELECT * FROM name. Recursive CTEs handle hierarchies. More readable than nested subqueries."
+    },
+    {
+      "slug": "rest-http-status-codes",
+      "request": "What HTTP status codes should my REST API use and when?",
+      "text_response": "Key REST status codes: 200 OK (successful GET/PUT), 201 Created (successful POST that created a resource), 204 No Content (successful DELETE or PUT with no response body), 400 Bad Request (malformed input or validation failure), 401 Unauthorized (missing or invalid authentication), 403 Forbidden (authenticated but not authorized), 404 Not Found (resource does not exist), 409 Conflict (state conflict, e.g. duplicate), 422 Unprocessable Entity (well-formed but semantically invalid), 429 Too Many Requests (rate limited), 500 Internal Server Error (unexpected server error), 503 Service Unavailable (server overloaded or down).",
+      "summary": "REST codes: 200 OK, 201 Created, 204 No Content, 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 500 Server Error."
+    },
+    {
+      "slug": "rest-pagination",
+      "request": "How should I implement pagination in a REST API?",
+      "text_response": "Two main approaches: offset-based and cursor-based. Offset-based: `GET /items?page=2&per_page=50` — simple but can skip or duplicate items if data changes between requests. Cursor-based: `GET /items?after=cursor_token&limit=50` — the cursor encodes the position (often an opaque encoded ID or timestamp), avoiding the shifting-offset problem. Return pagination metadata in a `Link` header (RFC 5988) or in the response body as `{ data: [...], next_cursor: \"...\", total: 1000 }`. For very large datasets, prefer cursor-based pagination. Always cap `per_page` at a maximum (e.g. 100) to prevent abuse.",
+      "summary": "Pagination: offset-based (page/per_page) is simple but unstable; cursor-based (after=token) is stable for changing datasets."
+    },
+    {
+      "slug": "rest-authentication",
+      "request": "What are the common authentication patterns for REST APIs?",
+      "text_response": "Common REST authentication patterns: API Keys — simple but no expiry; send in Authorization header (`Authorization: ApiKey <key>`) or as a query parameter (less secure). HTTP Basic Auth — Base64-encoded `username:password`; only use over HTTPS. Bearer tokens (JWT) — stateless tokens signed with a secret or key pair; client sends `Authorization: Bearer <token>`; server validates signature without a database lookup. OAuth 2.0 — delegated authorization; use Authorization Code flow for user-facing apps, Client Credentials for machine-to-machine. Session cookies — stateful; store session ID in a cookie; suitable for browser-based apps. Prefer JWTs or OAuth 2.0 for modern APIs.",
+      "summary": "REST auth: API Keys (simple), HTTP Basic (only over HTTPS), Bearer/JWT (stateless), OAuth 2.0 (delegated). Prefer JWT or OAuth for modern APIs."
+    },
+    {
+      "slug": "rest-versioning",
+      "request": "How should I version my REST API?",
+      "text_response": "Four common REST versioning strategies: URL path versioning (`/api/v1/users`) — most visible and cache-friendly, widely used. Query parameter (`/api/users?version=1`) — less clean but easy to test in a browser. Custom request header (`Api-Version: 1`) — keeps URLs clean but less discoverable. Content negotiation (`Accept: application/vnd.myapi.v1+json`) — purist REST approach, but complex. Best practice: use URL path versioning for public APIs due to clarity and cacheability. Support at least one previous version during deprecation periods and communicate sunset dates in response headers (`Sunset: Sat, 01 Jan 2026 00:00:00 GMT`).",
+      "summary": "REST versioning: URL path (/v1/) is most common and cache-friendly. Support previous versions during deprecation with Sunset headers."
+    },
+    {
+      "slug": "docker-volumes",
+      "request": "How do Docker volumes work and when should I use bind mounts vs named volumes?",
+      "text_response": "Docker has three storage types: named volumes, bind mounts, and tmpfs. Named volumes (`docker volume create mydata; docker run -v mydata:/app/data`) are managed by Docker, portable, and best for persistent data like databases. Bind mounts (`-v /host/path:/container/path`) map a host directory into the container — ideal for development so container code reflects local edits without rebuilding. tmpfs mounts store data in memory only, disappearing when the container stops — use for sensitive data you don't want persisted. For production databases, always use named volumes. For development source code hot-reloading, use bind mounts.",
+      "summary": "Named volumes are Docker-managed and portable; bind mounts map host paths (use for dev). tmpfs is in-memory only."
+    },
+    {
+      "slug": "docker-multi-stage-builds",
+      "request": "How do multi-stage Docker builds work?",
+      "text_response": "Multi-stage builds use multiple `FROM` instructions in a single Dockerfile. Each stage can have an alias: `FROM node:20 AS builder`. You can copy artifacts from one stage to another: `COPY --from=builder /app/dist /app/dist`. The final image contains only what the last `FROM` stage produces, discarding build tools and intermediate files. This dramatically reduces image size — a Node.js app's production image doesn't need npm or TypeScript. Use `--target builder` to stop at an intermediate stage for debugging. Order stages so the most cacheable layers come first to maximize Docker layer cache hits.",
+      "summary": "Multi-stage builds use multiple FROM instructions. COPY --from=stage copies artifacts. Final image only contains the last stage's layers."
+    },
+    {
+      "slug": "docker-networking",
+      "request": "How does Docker networking work and how do containers communicate?",
+      "text_response": "Docker provides several network drivers: bridge (default for standalone containers — containers on the same bridge network can communicate by container name), host (container shares the host network namespace — no network isolation), none (no network), and overlay (for multi-host Docker Swarm networks). In Docker Compose, services on the same Compose project share a default bridge network and can reach each other by service name as hostname. To expose a container port to the host, use `-p host_port:container_port`. Use `--network host` carefully — it bypasses Docker's network isolation. Inspect networks with `docker network inspect`.",
+      "summary": "Docker bridge networks let containers communicate by name. Compose services share a default network. Use -p to expose ports to the host."
+    },
+    {
+      "slug": "docker-health-checks",
+      "request": "How do I add health checks to a Docker container?",
+      "text_response": "Add a `HEALTHCHECK` instruction in the Dockerfile: `HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD curl -f http://localhost:8080/health || exit 1`. Parameters: `interval` — time between checks, `timeout` — how long to wait for a response, `start-period` — grace period after container starts before health is evaluated, `retries` — consecutive failures before marking unhealthy. A container in an `unhealthy` state is visible via `docker ps` and its `Status` field. Docker Compose and Kubernetes use health status to decide when to route traffic. The health check command must exit 0 for healthy, 1 for unhealthy.",
+      "summary": "HEALTHCHECK --interval=30s --timeout=10s CMD <check-command>. Exit 0=healthy, 1=unhealthy. Compose/k8s use this to gate traffic."
+    },
+    {
+      "slug": "testing-unit-vs-integration",
+      "request": "What is the difference between unit tests and integration tests?",
+      "text_response": "Unit tests test a single unit (function, method, class) in isolation, with all dependencies mocked or stubbed. They run fast, have no side effects, and pinpoint failures to a specific unit. Integration tests test how multiple components work together — for example, a service that reads from a real database or calls a real HTTP endpoint. They are slower, can have side effects (data written to a database), and require more setup. The testing pyramid suggests many unit tests, fewer integration tests, and even fewer end-to-end tests. Unit tests give you confident refactoring safety; integration tests give you confidence that the wired-up system works.",
+      "summary": "Unit tests: single unit, all deps mocked, fast. Integration tests: multiple components together, slower, may have side effects."
+    },
+    {
+      "slug": "testing-mocking",
+      "request": "How does mocking work in unit tests?",
+      "text_response": "A mock is a test double that replaces a real dependency and allows you to control its behavior and verify it was called correctly. In C#, popular libraries include Moq and NSubstitute. Create a mock: `var mock = new Mock<IService>()`. Set up a return value: `mock.Setup(s => s.GetData()).Returns(\"test\")`. Pass `mock.Object` to the system under test. After the test, verify calls: `mock.Verify(s => s.GetData(), Times.Once())`. Distinguish mocks from stubs (return canned values, no verification) and fakes (working simplified implementations, like an in-memory database). Over-mocking hides design problems — if you need many mocks, consider refactoring.",
+      "summary": "Mocks replace dependencies and verify interactions. In C#: Moq or NSubstitute. Setup return values, pass .Object, then Verify calls."
+    },
+    {
+      "slug": "testing-parameterized",
+      "request": "How do I write parameterized tests in xUnit?",
+      "text_response": "xUnit supports parameterized tests through `[Theory]` combined with data sources. `[InlineData]` provides inline values: `[Theory][InlineData(1, 2, 3)][InlineData(10, 20, 30)] void Add_ReturnsSum(int a, int b, int expected)`. `[MemberData]` points to a static property or method returning `IEnumerable<object[]>`. `[ClassData]` uses a class implementing `IEnumerable<object[]>`. For data from external sources, create a custom `DataAttribute` by subclassing `DataAttribute`. Test runners display each theory case as a separate test result. Use `[Theory]` when the same logic should hold for multiple input/output combinations — it's far more readable than duplicated test methods.",
+      "summary": "xUnit parameterized tests: [Theory] + [InlineData], [MemberData], or [ClassData]. Each row runs as a separate test case."
+    }
+  ],
+  "benchmark_cases": [
+    {
+      "id": "bc-001",
+      "query": "How do I rebase my branch onto main?",
+      "expected_slugs": ["git-rebase-onto-main"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "rebase"
+    },
+    {
+      "id": "bc-002",
+      "query": "I need to save my current work temporarily without committing",
+      "expected_slugs": ["git-stash-and-apply"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "stash"
+    },
+    {
+      "id": "bc-003",
+      "query": "How do I apply a specific commit from another branch?",
+      "expected_slugs": ["git-cherry-pick"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "cherry-pick"
+    },
+    {
+      "id": "bc-004",
+      "query": "How do I undo my last commit in Git?",
+      "expected_slugs": ["git-reset-hard"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "reset"
+    },
+    {
+      "id": "bc-005",
+      "query": "How do I resolve a Git merge conflict?",
+      "expected_slugs": ["git-merge-conflict-resolution"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "conflict"
+    },
+    {
+      "id": "bc-006",
+      "query": "How do I write async functions in Python?",
+      "expected_slugs": ["python-async-await"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "async"
+    },
+    {
+      "id": "bc-007",
+      "query": "What is the Python syntax for list comprehension?",
+      "expected_slugs": ["python-list-comprehensions"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "comprehension"
+    },
+    {
+      "id": "bc-008",
+      "query": "How do SQL indexes improve query performance?",
+      "expected_slugs": ["sql-indexes"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "index"
+    },
+    {
+      "id": "bc-009",
+      "query": "What HTTP status code should I return when a resource is not found?",
+      "expected_slugs": ["rest-http-status-codes"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "404"
+    },
+    {
+      "id": "bc-010",
+      "query": "How do I handle pagination in a REST API?",
+      "expected_slugs": ["rest-pagination"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "pagination"
+    },
+    {
+      "id": "bc-011",
+      "query": "What is the difference between named volumes and bind mounts in Docker?",
+      "expected_slugs": ["docker-volumes"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "volume"
+    },
+    {
+      "id": "bc-012",
+      "query": "How do I reduce Docker image size?",
+      "expected_slugs": ["docker-multi-stage-builds"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "multi-stage"
+    },
+    {
+      "id": "bc-013",
+      "query": "How do containers communicate with each other in Docker?",
+      "expected_slugs": ["docker-networking"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "network"
+    },
+    {
+      "id": "bc-014",
+      "query": "How do unit tests and integration tests differ?",
+      "expected_slugs": ["testing-unit-vs-integration"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "unit"
+    },
+    {
+      "id": "bc-015",
+      "query": "How do I write parameterized tests in xUnit?",
+      "expected_slugs": ["testing-parameterized"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "Theory"
+    },
+    {
+      "id": "bc-016",
+      "query": "How do I do an insert-or-update in SQL?",
+      "expected_slugs": ["sql-upsert"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "upsert"
+    },
+    {
+      "id": "bc-017",
+      "query": "What is JWT and how does it work for API authentication?",
+      "expected_slugs": ["rest-authentication"],
+      "expect_retrieval": true,
+      "expected_answer_hint": "JWT"
+    },
+    {
+      "id": "bc-018",
+      "query": "What is 2 + 2?",
+      "expected_slugs": [],
+      "expect_retrieval": false,
+      "expected_answer_hint": "4"
+    },
+    {
+      "id": "bc-019",
+      "query": "What is the capital of France?",
+      "expected_slugs": [],
+      "expect_retrieval": false,
+      "expected_answer_hint": "Paris"
+    },
+    {
+      "id": "bc-020",
+      "query": "Tell me a short joke.",
+      "expected_slugs": [],
+      "expect_retrieval": false,
+      "expected_answer_hint": null
+    }
+  ]
+}
