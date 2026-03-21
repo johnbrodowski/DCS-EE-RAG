@@ -5,7 +5,7 @@ A retrieval-augmented generation system combining two complementary architecture
 - **EE-RAG** (Elective Ephemeral RAG) — A five-layer pipeline where the model decides what to retrieve, and all retrieved content remains transient — never entering conversation history.
 - **DCS** (Dynamic Context Selection) — A deterministic routing layer that structures context using hierarchical identifiers (intent, domain, continuity nodes) rather than embedding similarity alone.
 
-Together they solve the core problem of long-context reasoning: selecting relevant information from extended interactions without flooding the context, contaminating history, or introducing noise.
+Together they attempt solve the core problem of long-context reasoning: selecting relevant information from extended interactions without flooding the context, contaminating history, or introducing noise.
 
 ---
 
