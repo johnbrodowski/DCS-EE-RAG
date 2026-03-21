@@ -13,6 +13,12 @@ Together they attempt solve the core problem of long-context reasoning: selectin
 
 <img width="1526" height="1024" alt="chart_2" src="https://github.com/user-attachments/assets/aef3d394-eb42-4a0a-9205-47adcaa7687a" />
 
+
+## Intergradet Benchmarking and Auto Tuning 
+<img width="1366" height="730" alt="image" src="https://github.com/user-attachments/assets/9b2bac82-8458-46b3-bcb6-5ffdcf51791e" />
+
+
+
 ### EE-RAG: The Five Layers
 
 ```
