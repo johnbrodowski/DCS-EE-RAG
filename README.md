@@ -11,6 +11,8 @@ Together they attempt solve the core problem of long-context reasoning: selectin
 
 ## Architecture
 
+<img width="1526" height="1024" alt="chart_2" src="https://github.com/user-attachments/assets/aef3d394-eb42-4a0a-9205-47adcaa7687a" />
+
 ### EE-RAG: The Five Layers
 
 ```
