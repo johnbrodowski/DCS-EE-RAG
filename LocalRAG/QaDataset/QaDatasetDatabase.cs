@@ -119,6 +119,28 @@ namespace LocalRAG.QaDataset
 
         // ── Backfill ──────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Clears all embeddings so they can be regenerated with new parameters.
+        /// </summary>
+        public async Task ResetAllEmbeddingsAsync()
+        {
+            await _writeLock.WaitAsync();
+            try
+            {
+                await using var conn = OpenConnection();
+                await conn.OpenAsync();
+
+                await using var cmd = new SqliteCommand(
+                    "UPDATE qa_items SET QuestionEmbedding = NULL, IsEmbedded = 0",
+                    conn);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
         public async Task<List<QaDatasetItem>> GetUnembeddedItemsAsync(int batchSize = 50)
         {
             await using var conn = OpenConnection();

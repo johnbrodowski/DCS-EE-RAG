@@ -41,7 +41,7 @@ namespace LocalRAG
 
             using (var vocabReader = new StreamReader(_config.VocabularyPath))
             {
-                _tokenizer.LoadVocabulary(vocabReader, convertInputToLowercase: true);
+                _tokenizer.LoadVocabulary(vocabReader, convertInputToLowercase: _config.LowercaseInput);
             }
 
             var hashOptions = new MemoryHashOptions
@@ -110,11 +110,15 @@ namespace LocalRAG
 
         private async Task<float[]> GetEmbeddingsInternalAsync(string textToEmbed)
         {
-            // IMPORTANT: Do NOT remove stop words for BERT embeddings!
-            // BERT is a contextual model trained on complete sentences.
-            // Stop words provide grammatical structure essential for semantic understanding.
-            // Only do minimal cleanup (whitespace normalization).
-            var text = NormalizeWhitespace(textToEmbed);
+            var text = textToEmbed;
+
+            // Optionally remove stop words before embedding.
+            // Off by default — BERT is trained on complete sentences and stop words
+            // provide grammatical structure. Enable for experimentation.
+            if (_config.RemoveStopWords)
+                text = RemoveStopWords(text);
+
+            text = NormalizeWhitespace(text);
 
             if (string.IsNullOrWhiteSpace(text))
                 throw new ArgumentException("Text is empty after preprocessing.", nameof(textToEmbed));

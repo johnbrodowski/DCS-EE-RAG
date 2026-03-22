@@ -11,6 +11,14 @@ namespace DemoApp
         public bool UseRag { get; set; } = true;
         public double Temperature { get; set; } = 0.7;
 
+        // ── Embedding settings ─────────────────────────────────────────────────
+        public bool RemoveStopWords { get; set; } = false;
+        public double OverlapPercentage { get; set; } = 25.0;
+        public int WordsPerChunk { get; set; } = 40;
+        public int MaxSequenceLength { get; set; } = 256;
+        public bool LowercaseInput { get; set; } = true;
+        public bool OverwriteEmbeddings { get; set; } = false;
+
         // ── DCS / EE-RAG pipeline settings ───────────────────────────────────
         public bool UseDcsPipeline { get; set; } = false;
         public int DcsTopK { get; set; } = 5;

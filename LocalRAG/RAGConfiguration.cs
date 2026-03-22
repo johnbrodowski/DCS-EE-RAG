@@ -43,6 +43,18 @@ namespace LocalRAG
         public int RetryDelayMs { get; set; } = 1000;
         public int InterOpNumThreads { get; set; } = 32;
         public int IntraOpNumThreads { get; set; } = 2;
+
+        /// <summary>
+        /// When true, stop words are removed from text before embedding.
+        /// BERT is trained on complete sentences so this is off by default.
+        /// </summary>
+        public bool RemoveStopWords { get; set; } = false;
+
+        /// <summary>
+        /// Controls whether input text is lowercased before tokenization.
+        /// Should match the BERT model variant (uncased=true, cased=false).
+        /// </summary>
+        public bool LowercaseInput { get; set; } = true;
  
         public int MaxCacheItems { get; set; } = 10000;
         public long CacheItemSizeThreshold { get; set; } = 1024 * 1024; // 1MB

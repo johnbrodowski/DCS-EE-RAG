@@ -13,11 +13,13 @@ namespace LocalRAG.QaDataset
         public bool IsRunning => _task != null && !_task.IsCompleted;
 
         /// <summary>Starts the backfill in the background.</summary>
+        /// <param name="overwriteExisting">When true, clears all existing embeddings first so they are regenerated.</param>
         public void Start(
             QaDatasetDatabase db,
             EmbedderClassNew embedder,
             IProgress<(int Done, int Total)>? progress = null,
-            Action<string>? onError = null)
+            Action<string>? onError = null,
+            bool overwriteExisting = false)
         {
             if (IsRunning) return;
 
@@ -28,6 +30,9 @@ namespace LocalRAG.QaDataset
             {
                 try
                 {
+                    if (overwriteExisting)
+                        await db.ResetAllEmbeddingsAsync();
+
                     await RunAsync(db, embedder, progress, ct);
                 }
                 catch (OperationCanceledException) { /* expected on Stop() */ }

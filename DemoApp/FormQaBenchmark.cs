@@ -48,6 +48,15 @@ namespace DemoApp
             numTemperature.Value = Clamp(0M, 2M, (decimal)_settings.Temperature);
             chkUseRag.Checked = _settings.UseRag;
 
+            // Embedding settings
+            chkRemoveStopWords.Checked = _settings.RemoveStopWords;
+            numOverlapPct.Value = Clamp(numOverlapPct.Minimum, numOverlapPct.Maximum, (decimal)_settings.OverlapPercentage);
+            numWordsPerChunk.Value = Clamp(numWordsPerChunk.Minimum, numWordsPerChunk.Maximum, _settings.WordsPerChunk);
+            var seqIdx = cmbMaxSeqLen.Items.IndexOf(_settings.MaxSequenceLength.ToString());
+            cmbMaxSeqLen.SelectedIndex = seqIdx >= 0 ? seqIdx : 1; // default to "256"
+            chkLowercase.Checked = _settings.LowercaseInput;
+            chkOverwriteEmbeddings.Checked = _settings.OverwriteEmbeddings;
+
             // DCS settings
             chkUseDcs.Checked = _settings.UseDcsPipeline;
             numTopK.Value = Clamp(numTopK.Minimum, numTopK.Maximum, _settings.DcsTopK);
@@ -76,6 +85,13 @@ namespace DemoApp
             _settings.MaxQuestions = (int)numQuestions.Value;
             _settings.Temperature = (double)numTemperature.Value;
             _settings.UseRag      = chkUseRag.Checked;
+
+            _settings.RemoveStopWords    = chkRemoveStopWords.Checked;
+            _settings.OverlapPercentage  = (double)numOverlapPct.Value;
+            _settings.WordsPerChunk      = (int)numWordsPerChunk.Value;
+            _settings.MaxSequenceLength  = int.TryParse(cmbMaxSeqLen.Text, out var seqLen) ? seqLen : 256;
+            _settings.LowercaseInput     = chkLowercase.Checked;
+            _settings.OverwriteEmbeddings = chkOverwriteEmbeddings.Checked;
 
             _settings.UseDcsPipeline = chkUseDcs.Checked;
             _settings.DcsTopK        = (int)numTopK.Value;
@@ -113,6 +129,18 @@ namespace DemoApp
             chkSilentMode.Enabled = dcs;
             // Old-style RAG injection is irrelevant when DCS pipeline is active
             chkUseRag.Enabled = !dcs;
+        }
+
+        private RAGConfiguration BuildRagConfigFromUI()
+        {
+            return new RAGConfiguration
+            {
+                RemoveStopWords   = chkRemoveStopWords.Checked,
+                OverlapPercentage = (double)numOverlapPct.Value,
+                WordsPerString    = (int)numWordsPerChunk.Value,
+                MaxSequenceLength = int.TryParse(cmbMaxSeqLen.Text, out var seqLen) ? seqLen : 256,
+                LowercaseInput    = chkLowercase.Checked
+            };
         }
 
         // ── Database ──────────────────────────────────────────────────────────
@@ -208,8 +236,11 @@ namespace DemoApp
             if (_db == null) return;
             if (_backfiller.IsRunning) return;
 
+            var ragConfig = BuildRagConfigFromUI();
+            bool overwrite = chkOverwriteEmbeddings.Checked;
+
             EmbedderClassNew embedder;
-            try { embedder = new EmbedderClassNew(new RAGConfiguration()); }
+            try { embedder = new EmbedderClassNew(ragConfig); }
             catch (Exception ex)
             {
                 AppendLine($"[Backfill] Cannot load BERT model: {ex.Message}");
@@ -218,7 +249,7 @@ namespace DemoApp
 
             btnStartBackfill.Enabled = false;
             btnStopBackfill.Enabled  = true;
-            AppendLine("[Backfill] Starting…");
+            AppendLine($"[Backfill] Starting…{(overwrite ? " (overwriting existing embeddings)" : "")}");
 
             var progress = new Progress<(int Done, int Total)>(p =>
             {
@@ -235,7 +266,7 @@ namespace DemoApp
             {
                 Invoke(() => AppendLine($"[Backfill] Error: {errMsg}"));
                 Invoke(() => ResetBackfillButtons());
-            });
+            }, overwriteExisting: overwrite);
 
             _ = Task.Run(async () =>
             {
