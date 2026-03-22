@@ -26,6 +26,17 @@ namespace DemoApp
             pbarBackfill = new ProgressBar();
             btnStartBackfill = new Button();
             btnStopBackfill = new Button();
+            grpEmbedding = new GroupBox();
+            chkRemoveStopWords = new CheckBox();
+            lblOverlap = new Label();
+            numOverlapPct = new NumericUpDown();
+            lblPctOverlap = new Label();
+            lblWordsPerChunk = new Label();
+            numWordsPerChunk = new NumericUpDown();
+            lblMaxSeqLen = new Label();
+            cmbMaxSeqLen = new ComboBox();
+            chkLowercase = new CheckBox();
+            chkOverwriteEmbeddings = new CheckBox();
             grpRun = new GroupBox();
             lblProvider = new Label();
             cmbProvider = new ComboBox();
@@ -74,6 +85,9 @@ namespace DemoApp
             chartPanel = new BenchmarkChart();
             grpImport.SuspendLayout();
             grpBackfill.SuspendLayout();
+            grpEmbedding.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)numOverlapPct).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numWordsPerChunk).BeginInit();
             grpRun.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)numTemperature).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numQuestions).BeginInit();
@@ -193,7 +207,119 @@ namespace DemoApp
             btnStopBackfill.TabIndex = 2;
             btnStopBackfill.Text = "Stop";
             btnStopBackfill.Click += btnStopBackfill_Click;
-            // 
+            //
+            // grpEmbedding
+            //
+            grpEmbedding.Controls.Add(chkRemoveStopWords);
+            grpEmbedding.Controls.Add(lblOverlap);
+            grpEmbedding.Controls.Add(numOverlapPct);
+            grpEmbedding.Controls.Add(lblPctOverlap);
+            grpEmbedding.Controls.Add(lblWordsPerChunk);
+            grpEmbedding.Controls.Add(numWordsPerChunk);
+            grpEmbedding.Controls.Add(lblMaxSeqLen);
+            grpEmbedding.Controls.Add(cmbMaxSeqLen);
+            grpEmbedding.Controls.Add(chkLowercase);
+            grpEmbedding.Controls.Add(chkOverwriteEmbeddings);
+            grpEmbedding.Location = new Point(8, 154);
+            grpEmbedding.Name = "grpEmbedding";
+            grpEmbedding.Size = new Size(755, 50);
+            grpEmbedding.TabIndex = 10;
+            grpEmbedding.TabStop = false;
+            grpEmbedding.Text = "Embedding Settings";
+            //
+            // chkRemoveStopWords
+            //
+            chkRemoveStopWords.AutoSize = true;
+            chkRemoveStopWords.Location = new Point(8, 22);
+            chkRemoveStopWords.Name = "chkRemoveStopWords";
+            chkRemoveStopWords.Size = new Size(127, 19);
+            chkRemoveStopWords.TabIndex = 0;
+            chkRemoveStopWords.Text = "Remove stop words";
+            //
+            // lblOverlap
+            //
+            lblOverlap.AutoSize = true;
+            lblOverlap.Location = new Point(148, 24);
+            lblOverlap.Name = "lblOverlap";
+            lblOverlap.Size = new Size(52, 15);
+            lblOverlap.TabIndex = 1;
+            lblOverlap.Text = "Overlap:";
+            //
+            // numOverlapPct
+            //
+            numOverlapPct.Location = new Point(202, 20);
+            numOverlapPct.Maximum = new decimal(new int[] { 75, 0, 0, 0 });
+            numOverlapPct.Name = "numOverlapPct";
+            numOverlapPct.Size = new Size(46, 23);
+            numOverlapPct.TabIndex = 1;
+            numOverlapPct.Value = new decimal(new int[] { 25, 0, 0, 0 });
+            //
+            // lblPctOverlap
+            //
+            lblPctOverlap.AutoSize = true;
+            lblPctOverlap.Location = new Point(250, 24);
+            lblPctOverlap.Name = "lblPctOverlap";
+            lblPctOverlap.Size = new Size(17, 15);
+            lblPctOverlap.TabIndex = 2;
+            lblPctOverlap.Text = "%";
+            //
+            // lblWordsPerChunk
+            //
+            lblWordsPerChunk.AutoSize = true;
+            lblWordsPerChunk.Location = new Point(278, 24);
+            lblWordsPerChunk.Name = "lblWordsPerChunk";
+            lblWordsPerChunk.Size = new Size(79, 15);
+            lblWordsPerChunk.TabIndex = 3;
+            lblWordsPerChunk.Text = "Words/chunk:";
+            //
+            // numWordsPerChunk
+            //
+            numWordsPerChunk.Location = new Point(360, 20);
+            numWordsPerChunk.Maximum = new decimal(new int[] { 200, 0, 0, 0 });
+            numWordsPerChunk.Minimum = new decimal(new int[] { 10, 0, 0, 0 });
+            numWordsPerChunk.Name = "numWordsPerChunk";
+            numWordsPerChunk.Size = new Size(50, 23);
+            numWordsPerChunk.TabIndex = 3;
+            numWordsPerChunk.Value = new decimal(new int[] { 40, 0, 0, 0 });
+            //
+            // lblMaxSeqLen
+            //
+            lblMaxSeqLen.AutoSize = true;
+            lblMaxSeqLen.Location = new Point(420, 24);
+            lblMaxSeqLen.Name = "lblMaxSeqLen";
+            lblMaxSeqLen.Size = new Size(72, 15);
+            lblMaxSeqLen.TabIndex = 4;
+            lblMaxSeqLen.Text = "Max tokens:";
+            //
+            // cmbMaxSeqLen
+            //
+            cmbMaxSeqLen.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbMaxSeqLen.Items.AddRange(new object[] { "128", "256", "512" });
+            cmbMaxSeqLen.Location = new Point(494, 20);
+            cmbMaxSeqLen.Name = "cmbMaxSeqLen";
+            cmbMaxSeqLen.Size = new Size(58, 23);
+            cmbMaxSeqLen.TabIndex = 4;
+            //
+            // chkLowercase
+            //
+            chkLowercase.AutoSize = true;
+            chkLowercase.Checked = true;
+            chkLowercase.CheckState = CheckState.Checked;
+            chkLowercase.Location = new Point(562, 22);
+            chkLowercase.Name = "chkLowercase";
+            chkLowercase.Size = new Size(82, 19);
+            chkLowercase.TabIndex = 5;
+            chkLowercase.Text = "Lowercase";
+            //
+            // chkOverwriteEmbeddings
+            //
+            chkOverwriteEmbeddings.AutoSize = true;
+            chkOverwriteEmbeddings.Location = new Point(652, 22);
+            chkOverwriteEmbeddings.Name = "chkOverwriteEmbeddings";
+            chkOverwriteEmbeddings.Size = new Size(80, 19);
+            chkOverwriteEmbeddings.TabIndex = 6;
+            chkOverwriteEmbeddings.Text = "Overwrite";
+            //
             // grpRun
             // 
             grpRun.Controls.Add(lblProvider);
@@ -214,7 +340,7 @@ namespace DemoApp
             grpRun.Controls.Add(chkSilentMode);
             grpRun.Controls.Add(pbarRunProgress);
             grpRun.Controls.Add(lblLiveStats);
-            grpRun.Location = new Point(8, 154);
+            grpRun.Location = new Point(8, 212);
             grpRun.Name = "grpRun";
             grpRun.Size = new Size(755, 124);
             grpRun.TabIndex = 2;
@@ -409,7 +535,7 @@ namespace DemoApp
             grpThresholds.Controls.Add(numIndetermThresh);
             grpThresholds.Controls.Add(lblPctIndeterm);
             grpThresholds.Controls.Add(btnSaveSettings);
-            grpThresholds.Location = new Point(8, 286);
+            grpThresholds.Location = new Point(8, 344);
             grpThresholds.Name = "grpThresholds";
             grpThresholds.Size = new Size(755, 54);
             grpThresholds.TabIndex = 3;
@@ -549,7 +675,7 @@ namespace DemoApp
             grpTuning.Controls.Add(cmbTuneScore);
             grpTuning.Controls.Add(btnAutoTune);
             grpTuning.Controls.Add(btnStopTune);
-            grpTuning.Location = new Point(8, 348);
+            grpTuning.Location = new Point(8, 406);
             grpTuning.Name = "grpTuning";
             grpTuning.Size = new Size(755, 76);
             grpTuning.TabIndex = 4;
@@ -652,7 +778,7 @@ namespace DemoApp
             rtbResults.BackColor = Color.FromArgb(30, 30, 30);
             rtbResults.Font = new Font("Consolas", 9F);
             rtbResults.ForeColor = Color.LightGray;
-            rtbResults.Location = new Point(8, 432);
+            rtbResults.Location = new Point(8, 490);
             rtbResults.Name = "rtbResults";
             rtbResults.ReadOnly = true;
             rtbResults.ScrollBars = RichTextBoxScrollBars.Vertical;
@@ -673,15 +799,16 @@ namespace DemoApp
             // 
             AutoScaleDimensions = new SizeF(7F, 15F);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(1228, 687);
+            ClientSize = new Size(1228, 745);
             Controls.Add(chartPanel);
             Controls.Add(grpImport);
             Controls.Add(grpBackfill);
+            Controls.Add(grpEmbedding);
             Controls.Add(grpRun);
             Controls.Add(grpThresholds);
             Controls.Add(grpTuning);
             Controls.Add(rtbResults);
-            MinimumSize = new Size(1244, 726);
+            MinimumSize = new Size(1244, 784);
             Name = "FormQaBenchmark";
             Text = "QA Dataset Benchmark";
             FormClosing += FormQaBenchmark_FormClosing;
@@ -690,6 +817,10 @@ namespace DemoApp
             grpImport.PerformLayout();
             grpBackfill.ResumeLayout(false);
             grpBackfill.PerformLayout();
+            grpEmbedding.ResumeLayout(false);
+            grpEmbedding.PerformLayout();
+            ((System.ComponentModel.ISupportInitialize)numOverlapPct).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numWordsPerChunk).EndInit();
             grpRun.ResumeLayout(false);
             grpRun.PerformLayout();
             ((System.ComponentModel.ISupportInitialize)numTemperature).EndInit();
@@ -721,6 +852,18 @@ namespace DemoApp
         private ProgressBar pbarBackfill;
         private Button btnStartBackfill;
         private Button btnStopBackfill;
+
+        private GroupBox grpEmbedding;
+        private CheckBox chkRemoveStopWords;
+        private Label lblOverlap;
+        private NumericUpDown numOverlapPct;
+        private Label lblPctOverlap;
+        private Label lblWordsPerChunk;
+        private NumericUpDown numWordsPerChunk;
+        private Label lblMaxSeqLen;
+        private ComboBox cmbMaxSeqLen;
+        private CheckBox chkLowercase;
+        private CheckBox chkOverwriteEmbeddings;
 
         private GroupBox grpRun;
         private Label lblProvider;
