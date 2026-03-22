@@ -15,8 +15,7 @@ Together they attempt solve the core problem of long-context reasoning: selectin
 
 
 ## Intergradet Benchmarking and Auto Tuning 
-<img width="1366" height="730" alt="image" src="https://github.com/user-attachments/assets/9b2bac82-8458-46b3-bcb6-5ffdcf51791e" />
-
+<img width="1366" height="727" alt="image" src="https://github.com/user-attachments/assets/d654ca0a-5bbb-410a-869b-874758bf99de" />
 
 
 ### EE-RAG: The Five Layers
