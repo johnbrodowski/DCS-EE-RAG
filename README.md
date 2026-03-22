@@ -14,7 +14,7 @@ Together they attempt solve the core problem of long-context reasoning: selectin
 <img width="1526" height="1024" alt="chart_2" src="https://github.com/user-attachments/assets/aef3d394-eb42-4a0a-9205-47adcaa7687a" />
 
 
-## Intergradet Benchmarking and Auto Tuning 
+## Intergrated Benchmarking and Auto Tuning 
 <img width="1366" height="727" alt="image" src="https://github.com/user-attachments/assets/d654ca0a-5bbb-410a-869b-874758bf99de" />
 
 
