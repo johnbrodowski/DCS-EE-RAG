@@ -14,7 +14,7 @@ Together they attempt solve the core problem of long-context reasoning: selectin
 <img width="1526" height="1024" alt="chart_2" src="https://github.com/user-attachments/assets/aef3d394-eb42-4a0a-9205-47adcaa7687a" />
 
 
-## Intergradet Benchmarking and Auto Tuning 
+## Integrated Benchmarking and Auto-Tuning
 <img width="1366" height="730" alt="image" src="https://github.com/user-attachments/assets/9b2bac82-8458-46b3-bcb6-5ffdcf51791e" />
 
 
@@ -215,10 +215,12 @@ public class RAGConfiguration
     string ModelPath             // ONNX BERT model (.onnx)
     string VocabularyPath        // BERT vocab file (vocab.txt)
 
-    // Chunking
-    int    MaxSequenceLength     // BERT max input length (default: 128)
+    // Chunking & Preprocessing
+    int    MaxSequenceLength     // BERT max input tokens (default: 256)
     int    WordsPerString        // Words per chunk (default: 40)
     double OverlapPercentage     // Chunk overlap % (default: 25)
+    bool   RemoveStopWords       // Strip stop words before embedding (default: false)
+    bool   LowercaseInput        // Lowercase text before tokenization (default: true)
 
     // LSH Index
     int    NumberOfHashFunctions // Hash functions per table (default: 8)
@@ -239,6 +241,19 @@ public class RAGConfiguration
     TimeSpan CacheExpiry              // Cache TTL (default: 15 minutes)
 }
 ```
+
+### Embedding Tuning (Benchmark UI)
+
+The benchmark form exposes embedding parameters for experimentation. Changes take effect on the next backfill run.
+
+| Setting | Control | Range | Default | Effect |
+|---------|---------|-------|---------|--------|
+| Remove stop words | CheckBox | on/off | off | Strips common words (the, a, is…) before BERT encoding. Off by default since BERT is trained on complete sentences. |
+| Overlap % | NumericUpDown | 0–75 | 25 | Sliding window overlap between consecutive chunks. Higher values produce more chunks with more shared context. |
+| Words/chunk | NumericUpDown | 10–200 | 40 | Number of words per chunk. Smaller chunks give finer granularity; larger chunks preserve more context per embedding. |
+| Max tokens | ComboBox | 128/256/512 | 256 | BERT input token limit. Shorter is faster; longer captures more of each chunk. |
+| Lowercase | CheckBox | on/off | on | Lowercase input before tokenization. Match to your BERT model variant (uncased = on, cased = off). |
+| Overwrite | CheckBox | on/off | off | When checked, clicking Start Backfill clears all existing embeddings first and re-embeds everything with the current parameters. |
 
 ### DCS Thresholds (in `DcsContextAssembler`)
 
