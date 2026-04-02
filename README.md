@@ -11,11 +11,13 @@ Together they attempt solve the core problem of long-context reasoning: selectin
 
 ## Architecture
 
-<img width="1526" height="1024" alt="chart_2" src="https://github.com/user-attachments/assets/aef3d394-eb42-4a0a-9205-47adcaa7687a" />
+<img width="1526" height="1024" alt="image" src="https://github.com/user-attachments/assets/bb9f2da7-5f8e-44b5-a2a0-fbf5f4046093" />
+
 
 
 ## Intergrated Benchmarking and Auto Tuning 
-<img width="1366" height="727" alt="image" src="https://github.com/user-attachments/assets/d654ca0a-5bbb-410a-869b-874758bf99de" />
+<img width="1366" height="727" alt="image" src="https://github.com/user-attachments/assets/d7fad94d-2f1c-4bbc-9a1b-eedf80101bd0" />
+
 
 
 ### EE-RAG: The Five Layers
