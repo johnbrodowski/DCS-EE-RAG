@@ -148,7 +148,7 @@ namespace LocalRAG
                 throw new InvalidOperationException("Model returned no output.");
 
             var tensor = output.AsTensor<float>();
-            var embeddings = ExtractClsEmbedding(tensor);
+            var embeddings = ExtractMeanEmbedding(tensor, attentionMask);
             var normalizedEmbeddings = Normalize(embeddings);
 
             // Store in memory index for similarity search
@@ -162,27 +162,54 @@ namespace LocalRAG
         }
 
         /// <summary>
-        /// Extracts the [CLS] token embedding from BERT's last_hidden_state output.
-        /// BERT output shape: [batch_size, sequence_length, hidden_dim]
-        /// The [CLS] token is at position 0 and represents the entire sequence.
+        /// Pools BERT's last_hidden_state into a single sentence embedding using
+        /// attention-mask-weighted mean pooling.
+        /// Output shape: [batch_size, sequence_length, hidden_dim].
+        /// MiniLM (and most modern sentence encoders) are trained for mean pooling,
+        /// not CLS-token extraction — averaging the unmasked token states yields the
+        /// representation the model was actually optimized to produce. Padding tokens
+        /// (attention_mask == 0) are excluded from the average.
         /// </summary>
-        private float[] ExtractClsEmbedding(Tensor<float> tensor)
+        private float[] ExtractMeanEmbedding(Tensor<float> tensor, Memory<long> attentionMask)
         {
             var dims = tensor.Dimensions.ToArray();
+            var mask = attentionMask.Span;
 
             if (dims.Length == 3)
             {
                 // Shape: [batch=1, seq_len, hidden_dim]
+                int seqLen = dims[1];
                 int hiddenDim = dims[2];
-                var clsEmbedding = new float[hiddenDim];
+                var pooled = new float[hiddenDim];
 
-                // Extract first token (CLS) embedding: tensor[0, 0, :]
-                for (int i = 0; i < hiddenDim; i++)
+                // Sum token states weighted by the attention mask, then divide by
+                // the number of unmasked tokens.
+                long validTokens = 0;
+                for (int t = 0; t < seqLen; t++)
                 {
-                    clsEmbedding[i] = tensor[0, 0, i];
+                    // attentionMask may be shorter/longer than seqLen in edge cases;
+                    // treat out-of-range positions as masked.
+                    if (t >= mask.Length || mask[t] == 0)
+                        continue;
+
+                    validTokens++;
+                    for (int i = 0; i < hiddenDim; i++)
+                        pooled[i] += tensor[0, t, i];
                 }
 
-                return clsEmbedding;
+                if (validTokens == 0)
+                {
+                    // No unmasked tokens — fall back to the first token rather than
+                    // returning a zero vector.
+                    for (int i = 0; i < hiddenDim; i++)
+                        pooled[i] = tensor[0, 0, i];
+                    return pooled;
+                }
+
+                for (int i = 0; i < hiddenDim; i++)
+                    pooled[i] /= validTokens;
+
+                return pooled;
             }
             else if (dims.Length == 2)
             {
