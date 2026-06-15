@@ -32,6 +32,11 @@ namespace LocalRAG
         // single-user corpus, where an exact scan is both fast and more accurate.
         private readonly ConcurrentDictionary<int, float[]> _exactVectors = new();
 
+        // Per-document chunk embeddings for chunk-aware exact search (doc Id -> chunk
+        // vectors). Lets exact retrieval match a query against the best chunk of a doc,
+        // not just its whole-document vector — the point of chunking buried content.
+        private readonly ConcurrentDictionary<int, float[][]> _exactChunkVectors = new();
+
         // True once the FTS5 'trigram' index exists; gates fuzzy candidate recall so a
         // missing tokenizer can't produce "no such table" query errors.
         private volatile bool _trigramAvailable;
@@ -105,9 +110,18 @@ namespace LocalRAG
             _cleanupTimer = new System.Threading.Timer(_ => CleanupCache(), null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
 
             InitializeLSH();
-            _ = InitializeDatabaseAsync();
+            _initTask = InitializeDatabaseAsync();
             StartProcessor();
         }
+
+        // Completes when tables exist and in-memory indexes have been warmed from disk.
+        private readonly Task _initTask;
+
+        /// <summary>Awaitable that completes once startup (schema + index warm-up) is done.</summary>
+        public Task EnsureReadyAsync() => _initTask ?? Task.CompletedTask;
+
+        /// <summary>Number of documents currently in the exact in-memory vector index.</summary>
+        public int GetExactIndexCount() => _exactVectors.Count;
 
         #region Initialization
 
@@ -115,6 +129,9 @@ namespace LocalRAG
         {
             await CreateTableAsync();
             await InitializeOrdinalsAsync();
+            // Rebuild the in-memory search indexes from any embeddings already on disk so
+            // vector/LSH search works immediately after a restart (and resumes a corpus).
+            await WarmIndexesFromDatabaseAsync();
         }
 
         private async Task CreateTableAsync()
@@ -1123,6 +1140,80 @@ END;
             LogMessage($"LSH rebuild complete. Processed {processed} records.");
         }
 
+        /// <summary>
+        /// Rebuilds ALL in-memory search indexes — exact whole-document vectors, exact
+        /// chunk vectors, and LSH — from the embeddings persisted in SQLite. Runs at
+        /// startup so vector search survives restarts, and lets a persistent corpus be
+        /// resumed/extended without re-embedding. Safe no-op on an empty database.
+        /// </summary>
+        public async Task WarmIndexesFromDatabaseAsync(Action<int, int>? progress = null)
+        {
+            _exactVectors.Clear();
+            _exactChunkVectors.Clear();
+            foreach (var hashTable in _hashTables)
+                hashTable.Clear();
+
+            const string query =
+                "SELECT Id, RequestEmbedding, RequestEmbeddingList, " +
+                "TextResponseEmbedding, ToolUseTextResponseEmbedding, " +
+                "TextResponseEmbeddingList, ToolUseTextResponseEmbeddingList " +
+                "FROM embeddings WHERE RequestEmbedding IS NOT NULL OR RequestEmbeddingList IS NOT NULL";
+
+            using var connection = await GetConnectionAsync();
+            using var command = new SqliteCommand(query, connection);
+
+            var rows = new List<(int Id, string? RE, string? REL, string? TRE, string? TUTRE, string? TREL, string? TUTREL)>();
+            using (var reader = await command.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    rows.Add((
+                        reader.GetInt32(0),
+                        reader.IsDBNull(1) ? null : reader.GetString(1),
+                        reader.IsDBNull(2) ? null : reader.GetString(2),
+                        reader.IsDBNull(3) ? null : reader.GetString(3),
+                        reader.IsDBNull(4) ? null : reader.GetString(4),
+                        reader.IsDBNull(5) ? null : reader.GetString(5),
+                        reader.IsDBNull(6) ? null : reader.GetString(6)
+                    ));
+                }
+            }
+
+            int processed = 0;
+            foreach (var r in rows)
+            {
+                var re = string.IsNullOrEmpty(r.RE) ? null : JsonConvert.DeserializeObject<float[]>(r.RE);
+                if (re != null)
+                {
+                    _exactVectors[r.Id] = re;
+                    InsertLSH(r.Id, re);
+                }
+
+                var rel = string.IsNullOrEmpty(r.REL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.REL);
+                if (rel != null && rel.Count > 0)
+                {
+                    _exactChunkVectors[r.Id] = rel.ToArray();
+                    foreach (var emb in rel) InsertLSH(r.Id, emb);
+                }
+
+                // Response / tool embeddings contribute to LSH recall (not exact search).
+                var tre = string.IsNullOrEmpty(r.TRE) ? null : JsonConvert.DeserializeObject<float[]>(r.TRE);
+                if (tre != null) InsertLSH(r.Id, tre);
+                var tutre = string.IsNullOrEmpty(r.TUTRE) ? null : JsonConvert.DeserializeObject<float[]>(r.TUTRE);
+                if (tutre != null) InsertLSH(r.Id, tutre);
+                var trel = string.IsNullOrEmpty(r.TREL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.TREL);
+                if (trel != null) foreach (var emb in trel) InsertLSH(r.Id, emb);
+                var tutrel = string.IsNullOrEmpty(r.TUTREL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.TUTREL);
+                if (tutrel != null) foreach (var emb in tutrel) InsertLSH(r.Id, emb);
+
+                processed++;
+                progress?.Invoke(processed, rows.Count);
+            }
+
+            if (processed > 0)
+                LogMessage($"Index warm-up complete. Loaded {processed} records into vector/LSH indexes.");
+        }
+
         #endregion
 
         #region Backfill Result Class
@@ -1406,6 +1497,10 @@ SELECT last_insert_rowid();";
             if (data.RequestEmbedding != null)
                 _exactVectors[data.Id] = data.RequestEmbedding;
 
+            // Mirror chunk vectors so exact search can match the best chunk of a doc.
+            if (data.RequestEmbeddingList != null && data.RequestEmbeddingList.Count > 0)
+                _exactChunkVectors[data.Id] = data.RequestEmbeddingList.ToArray();
+
             if (data.EmbedRequest && data.RequestEmbedding != null)
                 InsertLSH(data.Id, data.RequestEmbedding);
 
@@ -1670,8 +1765,24 @@ WHERE e.Id IN (
             if (searchEmbedding == null || searchEmbedding.Length == 0 || _exactVectors.IsEmpty)
                 return results;
 
-            var top = _exactVectors
-                .Select(kv => (Id: kv.Key, Sim: CalculateCosineSimilarity(searchEmbedding, kv.Value)))
+            // Score each document by the MAX cosine over its whole-document vector and any
+            // chunk vectors (max-pool), so a query that matches one buried chunk still wins.
+            var perDoc = new Dictionary<int, double>(_exactVectors.Count);
+            foreach (var kv in _exactVectors)
+                perDoc[kv.Key] = CalculateCosineSimilarity(searchEmbedding, kv.Value);
+
+            foreach (var kv in _exactChunkVectors)
+            {
+                foreach (var chunk in kv.Value)
+                {
+                    double sim = CalculateCosineSimilarity(searchEmbedding, chunk);
+                    if (!perDoc.TryGetValue(kv.Key, out var cur) || sim > cur)
+                        perDoc[kv.Key] = sim;
+                }
+            }
+
+            var top = perDoc
+                .Select(kv => (Id: kv.Key, Sim: kv.Value))
                 .Where(x => x.Sim >= minimumSimilarity)
                 .OrderByDescending(x => x.Sim)
                 .Take(topK)

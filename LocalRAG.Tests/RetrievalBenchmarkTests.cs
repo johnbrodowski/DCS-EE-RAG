@@ -38,7 +38,7 @@ public class RetrievalBenchmarkTests
         try
         {
             db = new EmbeddingDatabaseNew(config);
-            await Task.Delay(500);
+            await db.EnsureReadyAsync();
 
             var slugToId = await EERagBenchmark.SeedDatabaseAsync(dataset, db, generateEmbeddings: true);
 
@@ -59,7 +59,8 @@ public class RetrievalBenchmarkTests
         finally
         {
             if (db != null) await db.DisposeAsync();
-            CleanupDb(config.DatabasePath);
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BEIR_DB_PATH")))
+                CleanupDb(config.DatabasePath);
         }
     }
 
@@ -86,14 +87,14 @@ public class RetrievalBenchmarkTests
         try
         {
             db = new EmbeddingDatabaseNew(config);
-            await Task.Delay(500);
+            await db.EnsureReadyAsync(); // warms in-memory indexes from a persistent DB if reused
 
             var seedSw = System.Diagnostics.Stopwatch.StartNew();
             var slugToId = await EERagBenchmark.SeedDatabaseAsync(
                 dataset, db, generateEmbeddings: true,
                 new Progress<string>(m => { if (m.Contains("/100]") || m.StartsWith("Seeding complete")) _output.WriteLine(m); }));
             seedSw.Stop();
-            _output.WriteLine($"Seeded {slugToId.Count} docs in {seedSw.Elapsed.TotalSeconds:F1}s.");
+            _output.WriteLine($"Seeded {slugToId.Count} docs ({db.GetExactIndexCount()} in vector index) in {seedSw.Elapsed.TotalSeconds:F1}s.");
 
             // BEIR docs are single passages → SearchLevel 1; BEIR headline metric is
             // nDCG@10, Recall@100, so request depth 100.
@@ -115,7 +116,8 @@ public class RetrievalBenchmarkTests
         finally
         {
             if (db != null) await db.DisposeAsync();
-            CleanupDb(config.DatabasePath);
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BEIR_DB_PATH")))
+                CleanupDb(config.DatabasePath);
         }
     }
 
@@ -196,11 +198,16 @@ public class RetrievalBenchmarkTests
         var modelPath = Environment.GetEnvironmentVariable("BERT_MODEL_PATH") ?? defaults.ModelPath;
         var vocabPath = Environment.GetEnvironmentVariable("BERT_VOCAB_PATH") ?? defaults.VocabularyPath;
 
+        // BEIR_DB_PATH = reuse a persistent DB (warmed on open, kept after the run) so a
+        // corpus can be grown incrementally without re-embedding. Otherwise a throwaway temp DB.
+        var dbPath = Environment.GetEnvironmentVariable("BEIR_DB_PATH");
         var config = new RAGConfiguration
         {
             ModelPath      = modelPath,
             VocabularyPath = vocabPath,
-            DatabasePath   = Path.Combine(Path.GetTempPath(), $"retr_bench_{Guid.NewGuid():N}.db")
+            DatabasePath   = string.IsNullOrWhiteSpace(dbPath)
+                ? Path.Combine(Path.GetTempPath(), $"retr_bench_{Guid.NewGuid():N}.db")
+                : dbPath
         };
 
         // Optional: disable per-chunk embedding/indexing (INDEX_CHUNKS=0) to seed ~10x
@@ -208,9 +215,10 @@ public class RetrievalBenchmarkTests
         if (Environment.GetEnvironmentVariable("INDEX_CHUNKS") == "0")
             config.IndexChunkEmbeddings = false;
 
-        // Optional: exact brute-force vector search instead of LSH (USE_EXACT=1).
-        if (Environment.GetEnvironmentVariable("USE_EXACT") == "1")
-            config.UseExactVectorSearch = true;
+        // Optional: force exact (USE_EXACT=1) or LSH (USE_EXACT=0) vector search.
+        var useExact = Environment.GetEnvironmentVariable("USE_EXACT");
+        if (useExact == "1") config.UseExactVectorSearch = true;
+        else if (useExact == "0") config.UseExactVectorSearch = false;
 
         return (config, File.Exists(modelPath));
     }

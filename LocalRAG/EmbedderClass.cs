@@ -250,7 +250,9 @@ namespace LocalRAG
             if (string.IsNullOrWhiteSpace(text))
                 throw new ArgumentException("Text cannot be null or empty.", nameof(text));
 
-            var chunks = SlidingWindow(text, _config.WordsPerString, _config.OverlapPercentage);
+            var chunks = _config.ChunkingStrategy == ChunkingStrategy.FixedCount
+                ? FixedCountWindow(text, _config.ChunkCount, _config.OverlapPercentage)
+                : SlidingWindow(text, _config.WordsPerString, _config.OverlapPercentage);
             return await GetEmbeddingsBatchInternalAsync(chunks);
         }
 
@@ -425,6 +427,41 @@ namespace LocalRAG
             // Replace multiple whitespace characters with single space
             var normalized = System.Text.RegularExpressions.Regex.Replace(input.Trim(), @"\s+", " ");
             return normalized;
+        }
+
+        /// <summary>
+        /// Splits text into exactly <paramref name="chunkCount"/> overlapping chunks, each
+        /// sized so they tile the whole text with <paramref name="overlapPercentage"/>
+        /// overlap. <paramref name="chunkCount"/> &lt;= 1 (or text shorter than the count)
+        /// returns the whole text as a single chunk.
+        /// </summary>
+        private List<string> FixedCountWindow(string text, int chunkCount, double overlapPercentage)
+        {
+            if (overlapPercentage < 0 || overlapPercentage >= 100)
+                throw new ArgumentOutOfRangeException(nameof(overlapPercentage), "Overlap percentage must be between 0 and 100.");
+
+            var words = text.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+
+            if (chunkCount <= 1 || words.Length <= chunkCount)
+                return new List<string> { text };
+
+            double o = overlapPercentage / 100.0;
+            // chunkLen so that: chunkCount*L - (chunkCount-1)*o*L = totalWords
+            double denom = chunkCount - (chunkCount - 1) * o;
+            int chunkLen = Math.Max(1, (int)Math.Ceiling(words.Length / denom));
+            int stepSize = Math.Max(1, (int)Math.Round(chunkLen * (1 - o)));
+
+            var result = new List<string>();
+            for (int c = 0; c < chunkCount; c++)
+            {
+                int start = c * stepSize;
+                if (start >= words.Length) break;
+                int end = Math.Min(start + chunkLen, words.Length);
+                result.Add(string.Join(" ", words.Skip(start).Take(end - start)));
+                if (end >= words.Length) break;
+            }
+
+            return result;
         }
 
         private List<string> SlidingWindow(string text, int wordsPerString, double overlapPercentage)

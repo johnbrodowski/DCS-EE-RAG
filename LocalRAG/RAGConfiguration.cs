@@ -17,6 +17,15 @@ namespace LocalRAG
         Always
     }
 
+    /// <summary>How a document is split into chunks for the per-chunk embedding list.</summary>
+    public enum ChunkingStrategy
+    {
+        /// <summary>Fixed-size sliding window (<c>WordsPerString</c> words, <c>OverlapPercentage</c> overlap); chunk count varies with length.</summary>
+        WindowSize,
+        /// <summary>Split into exactly <c>ChunkCount</c> overlapping chunks (sized to fit), with <c>OverlapPercentage</c> overlap.</summary>
+        FixedCount
+    }
+
     /// <summary>
     /// Configuration settings for the LocalRAG system.
     /// </summary>
@@ -52,6 +61,21 @@ namespace LocalRAG
         public int MaxSequenceLength { get; set; } = 256;
         public int WordsPerString { get; set; } = 40;
         public double OverlapPercentage { get; set; } = 25;
+
+        /// <summary>
+        /// How documents are chunked for the per-chunk embedding list (when
+        /// <see cref="IndexChunkEmbeddings"/> is on). <see cref="ChunkingStrategy.WindowSize"/>
+        /// (default) uses fixed <see cref="WordsPerString"/>-word windows;
+        /// <see cref="ChunkingStrategy.FixedCount"/> splits into exactly
+        /// <see cref="ChunkCount"/> overlapping chunks. Both honor <see cref="OverlapPercentage"/>.
+        /// </summary>
+        public ChunkingStrategy ChunkingStrategy { get; set; } = ChunkingStrategy.WindowSize;
+
+        /// <summary>
+        /// Number of overlapping chunks to split each document into when
+        /// <see cref="ChunkingStrategy.FixedCount"/> is used. 1 = whole document (no split).
+        /// </summary>
+        public int ChunkCount { get; set; } = 2;
         public int NumberOfHashFunctions { get; set; } = 8;
         public int NumberOfHashTables { get; set; } = 10;
         public int MaxQueueSize { get; set; } = 1000;
@@ -82,12 +106,14 @@ namespace LocalRAG
         public bool IndexChunkEmbeddings { get; set; } = true;
 
         /// <summary>
-        /// When true, the vector retrieval channel does an exact brute-force cosine scan
-        /// over every embedding instead of LSH approximate candidate generation. More
-        /// accurate (no bucketing loss) and, at local single-user corpus sizes, fast
-        /// enough that the approximation isn't needed.
+        /// When true (default), the vector retrieval channel does an exact brute-force
+        /// cosine scan over every embedding instead of LSH approximate candidate
+        /// generation. More accurate (no bucketing loss) and, at local single-user corpus
+        /// sizes, fast enough that the approximation isn't needed. On BEIR SciFact this was
+        /// +0.033 nDCG@10 / +0.034 Recall@10 over LSH. Set false to fall back to LSH for
+        /// very large corpora where a full scan is too slow.
         /// </summary>
-        public bool UseExactVectorSearch { get; set; } = false;
+        public bool UseExactVectorSearch { get; set; } = true;
 
         /// <summary>
         /// Controls token-level fuzzy lexical matching (Jaro-Winkler scoring + prefix-
