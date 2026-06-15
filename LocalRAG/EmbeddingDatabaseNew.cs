@@ -32,6 +32,10 @@ namespace LocalRAG
         // single-user corpus, where an exact scan is both fast and more accurate.
         private readonly ConcurrentDictionary<int, float[]> _exactVectors = new();
 
+        // True once the FTS5 'trigram' index exists; gates fuzzy candidate recall so a
+        // missing tokenizer can't produce "no such table" query errors.
+        private volatile bool _trigramAvailable;
+
         private Task _processingTask;
         private bool _isDisposing;
 
@@ -184,6 +188,39 @@ CREATE TRIGGER IF NOT EXISTS embeddings_au AFTER UPDATE ON embeddings BEGIN
 END;
 ";
 
+            // Optional trigram FTS index for fuzzy candidate recall (substring / typo
+            // tolerant). Separate table + triggers so it can be created/backfilled
+            // independently of the primary FTS index.
+            const string createTrigramTable = @"
+CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_fts_trigram USING fts5(
+    RequestID,
+    Request,
+    TextResponse,
+    ToolUseTextResponse,
+    Summary,
+    content='embeddings',
+    content_rowid='Id',
+    tokenize='trigram'
+);
+";
+
+            const string createTrigramTriggers = @"
+CREATE TRIGGER IF NOT EXISTS embeddings_tg_ai AFTER INSERT ON embeddings BEGIN
+    INSERT INTO embeddings_fts_trigram(rowid, RequestID, Request, TextResponse, ToolUseTextResponse, Summary)
+    VALUES (new.Id, new.RequestID, new.Request, new.TextResponse, new.ToolUseTextResponse, new.Summary);
+END;
+CREATE TRIGGER IF NOT EXISTS embeddings_tg_ad AFTER DELETE ON embeddings BEGIN
+    INSERT INTO embeddings_fts_trigram(embeddings_fts_trigram, rowid, RequestID, Request, TextResponse, ToolUseTextResponse, Summary)
+    VALUES ('delete', old.Id, old.RequestID, old.Request, old.TextResponse, old.ToolUseTextResponse, old.Summary);
+END;
+CREATE TRIGGER IF NOT EXISTS embeddings_tg_au AFTER UPDATE ON embeddings BEGIN
+    INSERT INTO embeddings_fts_trigram(embeddings_fts_trigram, rowid, RequestID, Request, TextResponse, ToolUseTextResponse, Summary)
+    VALUES ('delete', old.Id, old.RequestID, old.Request, old.TextResponse, old.ToolUseTextResponse, old.Summary);
+    INSERT INTO embeddings_fts_trigram(rowid, RequestID, Request, TextResponse, ToolUseTextResponse, Summary)
+    VALUES (new.Id, new.RequestID, new.Request, new.TextResponse, new.ToolUseTextResponse, new.Summary);
+END;
+";
+
             using var connection = await GetConnectionAsync();
             using var transaction = connection.BeginTransaction();
 
@@ -205,6 +242,34 @@ END;
                 transaction.Rollback();
                 LogMessage($"Error creating tables: {ex.Message}");
                 throw;
+            }
+
+            // Create the trigram index in its own try/catch: an environment without the
+            // FTS5 'trigram' tokenizer must not break core initialization (the feature is
+            // off by default). Backfills pre-existing rows once.
+            try
+            {
+                using (var cmd = new SqliteCommand(createTrigramTable, connection))
+                    await cmd.ExecuteNonQueryAsync();
+                using (var cmd = new SqliteCommand(createTrigramTriggers, connection))
+                    await cmd.ExecuteNonQueryAsync();
+
+                using (var checkCmd = new SqliteCommand(
+                    "SELECT (SELECT count(*) FROM embeddings) > 0 AND (SELECT count(*) FROM embeddings_fts_trigram) = 0",
+                    connection))
+                {
+                    if (Convert.ToInt64(await checkCmd.ExecuteScalarAsync()) == 1)
+                        using (var rebuild = new SqliteCommand(
+                            "INSERT INTO embeddings_fts_trigram(embeddings_fts_trigram) VALUES('rebuild');", connection))
+                            await rebuild.ExecuteNonQueryAsync();
+                }
+
+                _trigramAvailable = true;
+            }
+            catch (Exception ex)
+            {
+                _trigramAvailable = false;
+                LogMessage($"Trigram FTS index unavailable (fuzzy candidate recall disabled): {ex.Message}");
             }
         }
 
@@ -426,14 +491,43 @@ END;
             string searchText,
             int topK,
             float minimumSimilarity = 0.5f,
-            int searchLevel = 2)
+            int searchLevel = 2,
+            bool? forceFuzzy = null)
         {
             if (string.IsNullOrWhiteSpace(searchText))
                 return new List<FeedbackDatabaseValues>();
 
+            var mode = _config.FuzzyLexicalMode;
+            // Whether the first pass uses fuzzy matching: forced by caller, or Always mode.
+            bool firstPassFuzzy = forceFuzzy ?? (mode == FuzzyLexicalMode.Always);
+
+            var results = await RunSearchPassAsync(searchText, topK, minimumSimilarity, searchLevel, firstPassFuzzy);
+
+            // Fallback escalation: if the (non-fuzzy) pass came up short and the mode allows
+            // it, retry once with fuzzy matching on. "Cheap and precise first, fuzzy only
+            // when needed." Skipped if the caller already forced fuzzy.
+            if (forceFuzzy != true &&
+                mode == FuzzyLexicalMode.Fallback &&
+                !firstPassFuzzy &&
+                results.Count < _config.FuzzyFallbackMinResults)
+            {
+                results = await RunSearchPassAsync(searchText, topK, minimumSimilarity, searchLevel, fuzzy: true);
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// One full retrieval pass: runs the three channels concurrently and max-fuses
+        /// them. <paramref name="fuzzy"/> controls whether the lexical channel uses
+        /// token-level fuzzy matching (and trigram recall, if configured).
+        /// </summary>
+        private async Task<List<FeedbackDatabaseValues>> RunSearchPassAsync(
+            string searchText, int topK, float minimumSimilarity, int searchLevel, bool fuzzy)
+        {
             // Run all three retrieval strategies concurrently. The vector channel is
             // either approximate (LSH) or exact brute-force, per configuration.
-            var ftsTask    = SearchWithFTSAsync(searchText, topK, searchLevel);
+            var ftsTask    = SearchWithFTSAsync(searchText, topK, searchLevel, fuzzy);
             var lshTask    = _config.UseExactVectorSearch
                 ? SearchWithExactAsync(searchText, topK, minimumSimilarity)
                 : SearchWithLSHAsync(searchText, topK, minimumSimilarity);
@@ -1443,7 +1537,7 @@ WHERE RequestID = @RequestID";
 
         #region Internal - Search Operations
 
-        private async Task<List<FeedbackDatabaseValues>> SearchWithFTSAsync(string searchText, int topK, int searchLevel)
+        private async Task<List<FeedbackDatabaseValues>> SearchWithFTSAsync(string searchText, int topK, int searchLevel, bool fuzzy)
         {
             var results = new List<FeedbackDatabaseValues>();
             var searchWords = PrepareSearchWords(searchText);
@@ -1451,13 +1545,41 @@ WHERE RequestID = @RequestID";
             if (searchWords.Length == 0)
                 return results;
 
+            // Fuzzy lexical matching: score with token-level Jaro-Winkler and broaden the
+            // pre-filter with prefix matching so word variants / prefix typos still
+            // surface candidates. (Mid-word typo *recall* via the optional trigram index;
+            // the vector channel already covers semantic + missing-word recall.)
+            double Score(string[] words, string text) =>
+                fuzzy ? CalculateFuzzyWordMatchScore(words, text) : CalculateWordMatchScore(words, text);
+
             // Build FTS5 query - wrap each term in double quotes so FTS5 treats
             // them as literal tokens rather than interpreting hyphens/operators
             // (e.g. "insert-or-update" would otherwise be parsed as insert OR or OR update,
-            // causing "no such column: or" errors)
-            var ftsQuery = string.Join(" OR ", searchWords.Select(w => $"\"{w}\""));
+            // causing "no such column: or" errors). With fuzzy on, simple alphanumeric
+            // tokens use prefix matching (term*); tokens with special chars keep the
+            // quoted-exact form (prefix '*' on those breaks the FTS5 parser).
+            var ftsQuery = string.Join(" OR ", searchWords.Select(w =>
+                fuzzy && w.All(char.IsLetterOrDigit) ? $"{w}*" : $"\"{w}\""));
 
-            const string query = @"
+            // Optional trigram candidate recall: when fuzzy is active and configured, also
+            // pull candidates whose text shares character trigrams with the query words, so
+            // mid-word typos ("passwrd" vs "password") still surface docs. The fuzzy scorer
+            // below is the precision filter over this broader pool.
+            bool useTrigram = fuzzy && _config.FuzzyCandidateRecall && _trigramAvailable;
+            string? trigramQuery = useTrigram ? BuildTrigramQuery(searchWords) : null;
+            useTrigram = useTrigram && trigramQuery != null;
+
+            string query = useTrigram ? @"
+SELECT e.* FROM embeddings e
+WHERE e.Id IN (
+    SELECT rowid FROM (
+        SELECT rowid FROM embeddings_fts WHERE embeddings_fts MATCH @SearchText ORDER BY rank LIMIT @TopK
+    )
+    UNION
+    SELECT rowid FROM (
+        SELECT rowid FROM embeddings_fts_trigram WHERE embeddings_fts_trigram MATCH @TrigramText ORDER BY rank LIMIT @TopK
+    )
+)" : @"
 SELECT e.* FROM embeddings e
 WHERE e.Id IN (
     SELECT rowid FROM embeddings_fts
@@ -1469,11 +1591,13 @@ WHERE e.Id IN (
             using var connection = await GetConnectionAsync();
             using var command = new SqliteCommand(query, connection);
             command.Parameters.AddWithValue("@SearchText", ftsQuery);
-            // Use a wider BM25 pre-filter (topK*5) so CalculateWordMatchScore sees enough
-            // candidates. BM25 can be fooled by high term-frequency in off-topic documents
-            // (e.g. "performance" in Docker entries outscoring "sql"+"indexes" in the SQL
-            // entry when the inner limit is too tight).  CalculateWordMatchScore is the
-            // precise ranker; BM25 is just a fast pre-filter.
+            if (useTrigram)
+                command.Parameters.AddWithValue("@TrigramText", trigramQuery!);
+            // Use a wider BM25 pre-filter (topK*5) so the scorer sees enough candidates.
+            // BM25 can be fooled by high term-frequency in off-topic documents (e.g.
+            // "performance" in Docker entries outscoring "sql"+"indexes" in the SQL entry
+            // when the inner limit is too tight). The word-match scorer is the precise
+            // ranker; BM25 is just a fast pre-filter.
             command.Parameters.AddWithValue("@TopK", topK * 5);
 
             using var reader = await command.ExecuteReaderAsync();
@@ -1489,9 +1613,9 @@ WHERE e.Id IN (
                     (searchLevel == 2 && isRequestValid && isResponseValid) ||
                     (searchLevel == 3 && isRequestValid && isResponseValid && isToolResponseValid))
                 {
-                    var requestScore = CalculateWordMatchScore(searchWords, feedbackData.Request ?? "");
-                    var responseScore = isResponseValid ? CalculateWordMatchScore(searchWords, feedbackData.TextResponse!) : 0;
-                    var toolResponseScore = isToolResponseValid ? CalculateWordMatchScore(searchWords, feedbackData.ToolUseTextResponse!) : 0;
+                    var requestScore = Score(searchWords, feedbackData.Request ?? "");
+                    var responseScore = isResponseValid ? Score(searchWords, feedbackData.TextResponse!) : 0;
+                    var toolResponseScore = isToolResponseValid ? Score(searchWords, feedbackData.ToolUseTextResponse!) : 0;
 
                     feedbackData.Similarity = searchLevel switch
                     {
@@ -1802,6 +1926,163 @@ FROM embeddings WHERE RequestID = @RequestID";
             return Math.Min(baseScore + phraseMatchBonus + (density * 0.1), 1.0);
         }
 
+        /// <summary>
+        /// Token-level fuzzy word-match score. For each query word it finds the best
+        /// Jaro-Winkler match among the document's words and gives partial credit when it
+        /// clears the threshold, so misspellings ("passwrd"≈"password") and minor variants
+        /// still score. Tokens of 3 chars or fewer require an exact match to avoid
+        /// spurious short-word collisions ("cat"≈"car"). Mirrors
+        /// <see cref="CalculateWordMatchScore"/>'s phrase + density bonuses.
+        /// </summary>
+        private double CalculateFuzzyWordMatchScore(string[] searchWords, string documentText)
+        {
+            if (string.IsNullOrEmpty(documentText) || searchWords.Length == 0)
+                return 0;
+
+            documentText = documentText.ToLower();
+            var docWords = documentText.Split(new[] { ' ', '.', ',', ';', ':', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
+            if (docWords.Length == 0) return 0;
+
+            double threshold = _config.FuzzyMatchThreshold;
+            var docWordSet = new HashSet<string>(docWords, StringComparer.OrdinalIgnoreCase);
+
+            double matchedCredit = 0;
+            foreach (var q in searchWords)
+            {
+                // Exact hit wins immediately; short tokens are exact-only.
+                if (docWordSet.Contains(q)) { matchedCredit += 1.0; continue; }
+                if (q.Length <= 3) continue;
+
+                double best = 0;
+                foreach (var d in docWords)
+                {
+                    // Cheap prune: skip words that differ too much in length to clear JW.
+                    if (Math.Abs(d.Length - q.Length) > 3) continue;
+                    double sim = JaroWinklerDistance(q, d);
+                    if (sim > best) best = sim;
+                    if (best >= 0.99) break;
+                }
+                if (best >= threshold) matchedCredit += best; // partial credit
+            }
+
+            double baseScore = matchedCredit / searchWords.Length;
+
+            // Phrase bonus: consecutive whole-word exact run (same as exact scorer).
+            bool phraseMatch = false;
+            if (searchWords.Length <= docWords.Length)
+            {
+                for (int i = 0; i <= docWords.Length - searchWords.Length; i++)
+                {
+                    bool match = true;
+                    for (int j = 0; j < searchWords.Length; j++)
+                    {
+                        if (!docWords[i + j].Equals(searchWords[j], StringComparison.OrdinalIgnoreCase))
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) { phraseMatch = true; break; }
+                }
+            }
+
+            double phraseMatchBonus = phraseMatch ? 0.2 : 0;
+            double density = matchedCredit / docWords.Length;
+            return Math.Min(baseScore + phraseMatchBonus + (density * 0.1), 1.0);
+        }
+
+        // ── Fuzzy string primitives (restored from EmbeddingDatabaseOriginal) ──
+
+        /// <summary>Jaro-Winkler similarity (0..1) between two short strings.</summary>
+        private double JaroWinklerDistance(string s1, string s2)
+        {
+            if (s1 == null || s2 == null)
+                return 0.0;
+
+            int s1Length = s1.Length;
+            int s2Length = s2.Length;
+
+            if (s1Length == 0 || s2Length == 0)
+                return 0.0;
+
+            int matchDistance = Math.Max(s1Length, s2Length) / 2 - 1;
+            bool[] s1Matches = new bool[s1Length];
+            bool[] s2Matches = new bool[s2Length];
+
+            int matches = 0;
+            for (int i = 0; i < s1Length; i++)
+            {
+                int start = Math.Max(0, i - matchDistance);
+                int end = Math.Min(i + matchDistance + 1, s2Length);
+
+                for (int j = start; j < end; j++)
+                {
+                    if (s2Matches[j]) continue;
+                    if (s1[i] != s2[j]) continue;
+                    s1Matches[i] = true;
+                    s2Matches[j] = true;
+                    matches++;
+                    break;
+                }
+            }
+
+            if (matches == 0) return 0.0;
+
+            double t = 0;
+            int k = 0;
+            for (int i = 0; i < s1Length; i++)
+            {
+                if (!s1Matches[i]) continue;
+                while (!s2Matches[k]) k++;
+                if (s1[i] != s2[k]) t++;
+                k++;
+            }
+
+            t /= 2.0;
+            double m = matches;
+
+            double jaroSimilarity = (m / s1Length + m / s2Length + (m - t) / m) / 3.0;
+
+            // Jaro-Winkler prefix adjustment.
+            int prefixLength = 0;
+            for (int i = 0; i < Math.Min(4, Math.Min(s1Length, s2Length)); i++)
+            {
+                if (s1[i] == s2[i])
+                    prefixLength++;
+                else
+                    break;
+            }
+
+            return jaroSimilarity + (0.1 * prefixLength * (1 - jaroSimilarity));
+        }
+
+        /// <summary>Levenshtein edit distance between two strings.</summary>
+        private int LevenshteinDistance(string s, string t)
+        {
+            int n = s.Length;
+            int m = t.Length;
+            int[,] d = new int[n + 1, m + 1];
+
+            if (n == 0) return m;
+            if (m == 0) return n;
+
+            for (int i = 0; i <= n; d[i, 0] = i++) { }
+            for (int j = 0; j <= m; d[0, j] = j++) { }
+
+            for (int i = 1; i <= n; i++)
+            {
+                for (int j = 1; j <= m; j++)
+                {
+                    int cost = (t[j - 1] == s[i - 1]) ? 0 : 1;
+                    d[i, j] = Math.Min(
+                        Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
+                        d[i - 1, j - 1] + cost
+                    );
+                }
+            }
+            return d[n, m];
+        }
+
         #endregion
 
         #region Helper Methods
@@ -1843,6 +2124,30 @@ FROM embeddings WHERE RequestID = @RequestID";
                 .Split(new[] { ' ', '.', ',', ';', ':', '!', '?' }, StringSplitOptions.RemoveEmptyEntries)
                 .Where(word => !StopWords.Contains(word) && word.Length > 1)
                 .ToArray();
+
+        /// <summary>
+        /// Builds an FTS5 'trigram' MATCH query: the OR of the distinct character trigrams
+        /// of the query words. Documents sharing trigrams surface as fuzzy candidates (so a
+        /// mid-word typo still overlaps the correct token); the Jaro-Winkler scorer then
+        /// filters for precision. Capped to keep the query bounded. Returns null when no
+        /// usable trigrams exist (all query words shorter than 3 chars).
+        /// </summary>
+        private static string? BuildTrigramQuery(string[] searchWords)
+        {
+            const int maxTrigrams = 48;
+            var grams = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var w in searchWords)
+            {
+                for (int i = 0; i + 3 <= w.Length; i++)
+                {
+                    var g = w.Substring(i, 3);
+                    if (!g.Contains('"')) grams.Add(g); // '"' would break the quoted token
+                }
+                if (grams.Count >= maxTrigrams) break;
+            }
+            if (grams.Count == 0) return null;
+            return string.Join(" OR ", grams.Take(maxTrigrams).Select(g => $"\"{g}\""));
+        }
 
         private FeedbackDatabaseValues ReadFeedbackFromReader(DbDataReader reader)
         {

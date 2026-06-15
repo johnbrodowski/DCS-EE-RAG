@@ -6,6 +6,17 @@ using System.Threading.Tasks;
 
 namespace LocalRAG
 {
+    /// <summary>How the lexical channel applies fuzzy (typo-tolerant) matching.</summary>
+    public enum FuzzyLexicalMode
+    {
+        /// <summary>Never use fuzzy matching; exact whole-word lexical scoring only.</summary>
+        Off,
+        /// <summary>Escalate to fuzzy only when the normal search returns too few results.</summary>
+        Fallback,
+        /// <summary>Use fuzzy matching on every query.</summary>
+        Always
+    }
+
     /// <summary>
     /// Configuration settings for the LocalRAG system.
     /// </summary>
@@ -77,6 +88,39 @@ namespace LocalRAG
         /// enough that the approximation isn't needed.
         /// </summary>
         public bool UseExactVectorSearch { get; set; } = false;
+
+        /// <summary>
+        /// Controls token-level fuzzy lexical matching (Jaro-Winkler scoring + prefix-
+        /// broadened FTS pre-filter), which tolerates misspellings/word variants on
+        /// distinctive terms. <see cref="FuzzyLexicalMode.Fallback"/> (default) only
+        /// escalates to fuzzy when the normal search returns fewer than
+        /// <see cref="FuzzyFallbackMinResults"/> results — cheap first, fuzzy only when
+        /// needed. <see cref="FuzzyLexicalMode.Always"/> uses it on every query;
+        /// <see cref="FuzzyLexicalMode.Off"/> disables it. The vector channel still does
+        /// the semantic / missing-word recall. Callers can also force fuzzy per query.
+        /// </summary>
+        public FuzzyLexicalMode FuzzyLexicalMode { get; set; } = FuzzyLexicalMode.Fallback;
+
+        /// <summary>
+        /// In <see cref="FuzzyLexicalMode.Fallback"/>, the result count at or below which
+        /// the search re-runs with fuzzy matching enabled. 1 = only when nothing was found.
+        /// </summary>
+        public int FuzzyFallbackMinResults { get; set; } = 1;
+
+        /// <summary>
+        /// Minimum Jaro-Winkler similarity (0..1) for a query word to count as a fuzzy
+        /// match to a document word. Tokens of 3 chars or fewer always require an exact
+        /// match regardless of this threshold.
+        /// </summary>
+        public double FuzzyMatchThreshold { get; set; } = 0.88;
+
+        /// <summary>
+        /// When true (and fuzzy matching is active), the lexical channel also pulls
+        /// candidates from a trigram FTS index, broadening recall to documents that exact
+        /// + prefix FTS misses (e.g. mid-word typos). Requires the trigram index; adds
+        /// some query cost. Default off.
+        /// </summary>
+        public bool FuzzyCandidateRecall { get; set; } = false;
 
         /// <summary>
         /// Controls whether input text is lowercased before tokenization.
