@@ -26,8 +26,13 @@ namespace LocalRAG
         /// Path to the ONNX BERT model file. Download a BERT model in ONNX format and update this path.
         /// Example: https://huggingface.co/models?library=onnx&search=bert
         /// </summary>
-        public string ModelPath { get; set; } = GetAppPath(Path.Combine("all-MiniLM-L6-v2-ONNX", "model.onnx"));
-        public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("all-MiniLM-L6-v2-ONNX", "vocab.txt"));
+        // GTE-small (int8 / AVX512-VNNI). Drop-in for MiniLM: BERT-WordPiece tokenizer,
+        // mean pooling, 384-dim — but markedly more accurate. On BEIR SciFact (full
+        // pipeline, chunks-off) it lifted nDCG@10 0.544 -> 0.705 over MiniLM at ~the same
+        // ingestion speed (int8 VNNI). MIT-licensed. The int8 variant trades ~0.01 nDCG
+        // vs fp32 for ~1.7x faster inference on VNNI-capable CPUs.
+        public string ModelPath { get; set; } = GetAppPath(Path.Combine("gte-small", "model_qint8_avx512_vnni.onnx"));
+        public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("gte-small", "vocab.txt"));
 
         /// <summary>
         /// Path to the BERT vocabulary file (vocab.txt). Should match the BERT model being used.
@@ -64,6 +69,14 @@ namespace LocalRAG
         /// quality is corpus-dependent and should be measured on the benchmark.
         /// </summary>
         public bool IndexChunkEmbeddings { get; set; } = true;
+
+        /// <summary>
+        /// When true, the vector retrieval channel does an exact brute-force cosine scan
+        /// over every embedding instead of LSH approximate candidate generation. More
+        /// accurate (no bucketing loss) and, at local single-user corpus sizes, fast
+        /// enough that the approximation isn't needed.
+        /// </summary>
+        public bool UseExactVectorSearch { get; set; } = false;
 
         /// <summary>
         /// Controls whether input text is lowercased before tokenization.

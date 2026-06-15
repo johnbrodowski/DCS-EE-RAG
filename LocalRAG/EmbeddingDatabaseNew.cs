@@ -25,6 +25,13 @@ namespace LocalRAG
 
         private List<List<float[]>> _hashFunctions;
         private List<Dictionary<int, List<int>>> _hashTables;
+
+        // Exact (brute-force) in-memory vector index: doc Id -> RequestEmbedding.
+        // Populated alongside LSH. Lets retrieval score EVERY document instead of an
+        // approximate LSH candidate subset — viable here because this is a local,
+        // single-user corpus, where an exact scan is both fast and more accurate.
+        private readonly ConcurrentDictionary<int, float[]> _exactVectors = new();
+
         private Task _processingTask;
         private bool _isDisposing;
 
@@ -424,9 +431,12 @@ END;
             if (string.IsNullOrWhiteSpace(searchText))
                 return new List<FeedbackDatabaseValues>();
 
-            // Run all three retrieval strategies concurrently.
+            // Run all three retrieval strategies concurrently. The vector channel is
+            // either approximate (LSH) or exact brute-force, per configuration.
             var ftsTask    = SearchWithFTSAsync(searchText, topK, searchLevel);
-            var lshTask    = SearchWithLSHAsync(searchText, topK, minimumSimilarity);
+            var lshTask    = _config.UseExactVectorSearch
+                ? SearchWithExactAsync(searchText, topK, minimumSimilarity)
+                : SearchWithLSHAsync(searchText, topK, minimumSimilarity);
             var memoryTask = SearchMemoryBasedAsync(searchText, topK);
             await Task.WhenAll(ftsTask, lshTask, memoryTask);
             var ftsResults    = ftsTask.Result;
@@ -1298,6 +1308,10 @@ SELECT last_insert_rowid();";
 
         private void ProcessLSHForData(FeedbackDatabaseValues data)
         {
+            // Mirror the primary vector into the exact in-memory index.
+            if (data.RequestEmbedding != null)
+                _exactVectors[data.Id] = data.RequestEmbedding;
+
             if (data.EmbedRequest && data.RequestEmbedding != null)
                 InsertLSH(data.Id, data.RequestEmbedding);
 
@@ -1516,6 +1530,40 @@ WHERE e.Id IN (
             }
 
             return results.OrderByDescending(x => x.Similarity).Take(topK).ToList();
+        }
+
+        /// <summary>
+        /// Exact nearest-neighbour vector search: brute-force cosine over every indexed
+        /// embedding, no LSH approximation. At local single-user scale this scans in a
+        /// few milliseconds and recovers the recall LSH bucketing discards. Only the
+        /// top-K rows are loaded from the database.
+        /// </summary>
+        private async Task<List<FeedbackDatabaseValues>> SearchWithExactAsync(string searchText, int topK, float minimumSimilarity)
+        {
+            var results = new List<FeedbackDatabaseValues>();
+
+            float[]? searchEmbedding = await _embedder.GetEmbeddingsAsync(searchText);
+            if (searchEmbedding == null || searchEmbedding.Length == 0 || _exactVectors.IsEmpty)
+                return results;
+
+            var top = _exactVectors
+                .Select(kv => (Id: kv.Key, Sim: CalculateCosineSimilarity(searchEmbedding, kv.Value)))
+                .Where(x => x.Sim >= minimumSimilarity)
+                .OrderByDescending(x => x.Sim)
+                .Take(topK)
+                .ToList();
+
+            foreach (var (id, sim) in top)
+            {
+                var doc = await GetFeedbackDataByIdAsync(id);
+                if (doc != null)
+                {
+                    doc.Similarity = sim;
+                    results.Add(doc);
+                }
+            }
+
+            return results;
         }
 
         private async Task<List<FeedbackDatabaseValues>> SearchByTextContentAsync(string text)

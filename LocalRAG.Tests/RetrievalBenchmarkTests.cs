@@ -208,6 +208,10 @@ public class RetrievalBenchmarkTests
         if (Environment.GetEnvironmentVariable("INDEX_CHUNKS") == "0")
             config.IndexChunkEmbeddings = false;
 
+        // Optional: exact brute-force vector search instead of LSH (USE_EXACT=1).
+        if (Environment.GetEnvironmentVariable("USE_EXACT") == "1")
+            config.UseExactVectorSearch = true;
+
         return (config, File.Exists(modelPath));
     }
 

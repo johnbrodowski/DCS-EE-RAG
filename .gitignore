@@ -382,3 +382,4 @@ test.runsettings
 # Benchmark data (downloaded, may be non-commercially licensed) and local results
 BenchmarkData/beir/
 BenchmarkResults/
+models/
