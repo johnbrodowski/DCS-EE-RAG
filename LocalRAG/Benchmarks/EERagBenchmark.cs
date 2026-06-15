@@ -12,12 +12,12 @@ namespace LocalRAG.Benchmarks
 
         // ── Dataset loading ───────────────────────────────────────────────────
 
-        public static BenchmarkDataset LoadEmbeddedDataset()
+        public static BenchmarkDataset LoadEmbeddedDataset(string resourceName = EmbeddedResourceName)
         {
             var assembly = Assembly.GetExecutingAssembly();
-            using var stream = assembly.GetManifestResourceStream(EmbeddedResourceName)
+            using var stream = assembly.GetManifestResourceStream(resourceName)
                 ?? throw new InvalidOperationException(
-                    $"Embedded resource '{EmbeddedResourceName}' not found. " +
+                    $"Embedded resource '{resourceName}' not found. " +
                     $"Ensure the file is marked as EmbeddedResource in LocalRAG.csproj.");
             using var reader = new StreamReader(stream);
             var json = reader.ReadToEnd();

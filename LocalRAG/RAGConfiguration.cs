@@ -41,14 +41,29 @@ namespace LocalRAG
         public int MaxQueueSize { get; set; } = 1000;
         public int MaxRetryAttempts { get; set; } = 3;
         public int RetryDelayMs { get; set; } = 1000;
-        public int InterOpNumThreads { get; set; } = 32;
-        public int IntraOpNumThreads { get; set; } = 2;
+        // ONNX Runtime threading. BERT is a sequential graph, so inter-op parallelism
+        // (running independent graph branches concurrently) buys almost nothing — 32 was
+        // 4x oversubscribed on an 8-core machine and just added scheduling overhead.
+        // Intra-op is where the matmuls parallelize; 0 lets ORT use all physical cores
+        // instead of being capped at 2.
+        public int InterOpNumThreads { get; set; } = 1;
+        public int IntraOpNumThreads { get; set; } = 0;
 
         /// <summary>
         /// When true, stop words are removed from text before embedding.
         /// BERT is trained on complete sentences so this is off by default.
         /// </summary>
         public bool RemoveStopWords { get; set; } = false;
+
+        /// <summary>
+        /// When true (default), each document is also split into overlapping chunks and
+        /// every chunk is embedded and indexed into LSH separately, giving sub-document
+        /// recall at the cost of ~N extra forward passes per document (the dominant
+        /// ingestion cost). Set false to index only the single full-text embedding —
+        /// roughly an order of magnitude faster to seed. Whether it costs retrieval
+        /// quality is corpus-dependent and should be measured on the benchmark.
+        /// </summary>
+        public bool IndexChunkEmbeddings { get; set; } = true;
 
         /// <summary>
         /// Controls whether input text is lowercased before tokenization.

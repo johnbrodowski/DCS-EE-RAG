@@ -23,6 +23,7 @@
 
   <ItemGroup>
     <None Include="..\dcs_test_messages.json" CopyToOutputDirectory="PreserveNewest" Link="dcs_test_messages.json" />
+    <None Include="retrieval_baseline.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

@@ -239,6 +239,11 @@ namespace LocalRAG
 
         /// <summary>
         /// Splits text into overlapping chunks and generates embeddings for each.
+        /// All chunks for a document are embedded in a single batched ONNX Run
+        /// (input shape [N, seq_len]) rather than N sequential calls — this saturates
+        /// the CPU and removes per-call overhead. Per-row results are identical to
+        /// embedding each chunk individually (BERT rows are independent), so this is a
+        /// pure throughput optimization.
         /// </summary>
         public async Task<List<float[]>> SplitStringIntoEmbeddingsListAsync(string text)
         {
@@ -246,23 +251,98 @@ namespace LocalRAG
                 throw new ArgumentException("Text cannot be null or empty.", nameof(text));
 
             var chunks = SlidingWindow(text, _config.WordsPerString, _config.OverlapPercentage);
-            var embeddingList = new List<float[]>(chunks.Count);
+            return await GetEmbeddingsBatchInternalAsync(chunks);
+        }
 
-            foreach (var chunk in chunks)
+        /// <summary>
+        /// Embeds a batch of texts in one ONNX inference call. Mirrors the preprocessing,
+        /// mean pooling, normalization and memory-index updates of the single-text path.
+        /// </summary>
+        private async Task<List<float[]>> GetEmbeddingsBatchInternalAsync(IReadOnlyList<string> rawTexts)
+        {
+            int seq = _config.MaxSequenceLength;
+
+            // Preprocess and drop chunks that are empty after normalization, keeping the
+            // raw chunk text (for the memory-index tag) aligned with the processed text.
+            var raw = new List<string>(rawTexts.Count);
+            var processed = new List<string>(rawTexts.Count);
+            foreach (var t in rawTexts)
             {
-                try
-                {
-                    var embedding = await GetEmbeddingsAsync(chunk);
-                    embeddingList.Add(embedding);
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Failed to embed chunk: {ex.Message}");
-                    // Continue with other chunks rather than failing entirely
-                }
+                var p = _config.RemoveStopWords ? RemoveStopWords(t) : t;
+                p = NormalizeWhitespace(p);
+                if (string.IsNullOrWhiteSpace(p)) continue;
+                raw.Add(t);
+                processed.Add(p);
             }
 
-            return embeddingList;
+            int n = processed.Count;
+            if (n == 0) return new List<float[]>();
+
+            bool hasTypeIds = _session.InputMetadata.ContainsKey("token_type_ids");
+            var ids   = new long[n * seq];
+            var mask  = new long[n * seq];
+            var types = hasTypeIds ? new long[n * seq] : null;
+
+            for (int r = 0; r < n; r++)
+            {
+                var (inputIds, attentionMask, tokenTypeIds) =
+                    _tokenizer.Encode(processed[r], seq, seq);
+                inputIds.Span.CopyTo(ids.AsSpan(r * seq, seq));
+                attentionMask.Span.CopyTo(mask.AsSpan(r * seq, seq));
+                if (hasTypeIds) tokenTypeIds.Span.CopyTo(types!.AsSpan(r * seq, seq));
+            }
+
+            var inputData = new List<NamedOnnxValue>
+            {
+                NamedOnnxValue.CreateFromTensor("input_ids",
+                    new DenseTensor<long>(ids, new[] { n, seq })),
+                NamedOnnxValue.CreateFromTensor("attention_mask",
+                    new DenseTensor<long>(mask, new[] { n, seq }))
+            };
+            if (hasTypeIds)
+                inputData.Add(NamedOnnxValue.CreateFromTensor("token_type_ids",
+                    new DenseTensor<long>(types!, new[] { n, seq })));
+
+            using var results = await Task.Run(() => _session.Run(inputData));
+
+            var output = results.FirstOrDefault(r => r.Name == "last_hidden_state")
+                      ?? results.FirstOrDefault();
+            if (output == null)
+                throw new InvalidOperationException("Model returned no output.");
+
+            var tensor = output.AsTensor<float>(); // [n, seq, hidden]
+            int hidden = tensor.Dimensions[2];
+
+            var list = new List<float[]>(n);
+            for (int r = 0; r < n; r++)
+            {
+                var pooled = new float[hidden];
+
+                // Attention-mask-weighted mean pool over this row's tokens.
+                long valid = 0;
+                for (int t = 0; t < seq; t++)
+                {
+                    if (mask[r * seq + t] == 0) continue;
+                    valid++;
+                    for (int i = 0; i < hidden; i++)
+                        pooled[i] += tensor[r, t, i];
+                }
+
+                if (valid == 0)
+                    for (int i = 0; i < hidden; i++) pooled[i] = tensor[r, 0, i];
+                else
+                    for (int i = 0; i < hidden; i++) pooled[i] /= valid;
+
+                var normalized = Normalize(pooled);
+                list.Add(normalized);
+
+                await _memoryIndex.AddOrUpdateAsync(
+                    id: Guid.NewGuid().ToString(),
+                    vector: normalized,
+                    tags: new Dictionary<string, string> { { "text", raw[r] } });
+            }
+
+            return list;
         }
 
         /// <summary>

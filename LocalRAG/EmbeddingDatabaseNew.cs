@@ -1573,7 +1573,11 @@ LIMIT 100";
                 }
             }
 
-            return candidateSet.Take(topK * 2).ToList();
+            // Return the full LSH union. The caller (SearchWithLSHAsync) cosine-rescores
+            // every candidate and applies OrderByDescending(...).Take(topK), so the final
+            // cut is made by score, not by arbitrary hash-set iteration order. Truncating
+            // here with Take(topK * 2) discarded good neighbours before they were scored.
+            return candidateSet.ToList();
         }
 
         private List<int> ComputeLSH(float[] vector)
@@ -1608,16 +1612,21 @@ LIMIT 100";
         {
             var tasks = new List<Task>();
 
-            if (data.EmbedRequestList && !string.IsNullOrEmpty(data.Request))
+            // Chunk-list embeddings are the dominant ingestion cost (~N forward passes
+            // per document). They can be disabled globally via IndexChunkEmbeddings when
+            // the single full-text embedding is sufficient for the corpus.
+            bool chunks = _config.IndexChunkEmbeddings;
+
+            if (chunks && data.EmbedRequestList && !string.IsNullOrEmpty(data.Request))
                 tasks.Add(_embedder.HandleListEmbedding(data.Request, true, list => data.RequestEmbeddingList = list));
 
-            if (data.EmbedTextResponseList && !string.IsNullOrEmpty(data.TextResponse))
+            if (chunks && data.EmbedTextResponseList && !string.IsNullOrEmpty(data.TextResponse))
                 tasks.Add(_embedder.HandleListEmbedding(data.TextResponse, true, list => data.TextResponseEmbeddingList = list));
 
-            if (data.EmbedToolUseTextResponseList && !string.IsNullOrEmpty(data.ToolUseTextResponse))
+            if (chunks && data.EmbedToolUseTextResponseList && !string.IsNullOrEmpty(data.ToolUseTextResponse))
                 tasks.Add(_embedder.HandleListEmbedding(data.ToolUseTextResponse, true, list => data.ToolUseTextResponseEmbeddingList = list));
 
-            if (data.EmbedSummaryList && !string.IsNullOrEmpty(data.Summary))
+            if (chunks && data.EmbedSummaryList && !string.IsNullOrEmpty(data.Summary))
                 tasks.Add(_embedder.HandleListEmbedding(data.Summary, true, list => data.SummaryEmbeddingList = list));
 
             if (data.EmbedRequest && !string.IsNullOrEmpty(data.Request))
