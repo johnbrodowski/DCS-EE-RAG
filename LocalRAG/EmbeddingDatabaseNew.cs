@@ -15,6 +15,7 @@ namespace LocalRAG
     {
         private readonly RAGConfiguration _config;
         private readonly EmbedderClassNew _embedder;
+        private readonly RerankerClass? _reranker;
         private readonly ConcurrentDictionary<string, CacheEntry<object>> _cache;
         private readonly ConcurrentQueue<(FeedbackDatabaseValues data, TaskCompletionSource<bool> completion)> _updateQueue;
         private readonly SemaphoreSlim _queueSemaphore;
@@ -99,6 +100,23 @@ namespace LocalRAG
         {
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _embedder = new EmbedderClassNew(config);
+
+            // Optional cross-encoder reranker. Isolated so a missing model file just
+            // disables reranking instead of breaking construction.
+            if (_config.UseReranker && !string.IsNullOrEmpty(_config.RerankerModelPath) && File.Exists(_config.RerankerModelPath))
+            {
+                try
+                {
+                    _reranker = new RerankerClass(
+                        _config.RerankerModelPath, _config.RerankerVocabPath,
+                        _config.MaxSequenceLength, _config.LowercaseInput);
+                }
+                catch (Exception ex)
+                {
+                    _reranker = null;
+                    LogMessage($"Reranker unavailable: {ex.Message}");
+                }
+            }
             _logBuilder = new StringBuilder();
             _cache = new ConcurrentDictionary<string, CacheEntry<object>>();
             _updateQueue = new ConcurrentQueue<(FeedbackDatabaseValues, TaskCompletionSource<bool>)>();
@@ -531,7 +549,39 @@ END;
                 results = await RunSearchPassAsync(searchText, topK, minimumSimilarity, searchLevel, fuzzy: true);
             }
 
+            if (_reranker != null && _config.UseReranker && results.Count > 1)
+                results = await Task.Run(() => ApplyReranker(searchText, results));
+
             return results;
+        }
+
+        /// <summary>
+        /// Re-scores the top <see cref="RAGConfiguration.RerankCandidateCount"/> candidates
+        /// with the cross-encoder and reorders them; the remainder keep their order. The
+        /// reranked candidates' <see cref="FeedbackDatabaseValues.Similarity"/> becomes the
+        /// cross-encoder score.
+        /// </summary>
+        private List<FeedbackDatabaseValues> ApplyReranker(string query, List<FeedbackDatabaseValues> results)
+        {
+            try
+            {
+                int n = Math.Min(_config.RerankCandidateCount, results.Count);
+                var head = results.Take(n).ToList();
+                var passages = head.Select(r => r.Request ?? string.Empty).ToList();
+
+                var scores = _reranker!.Score(query, passages);
+                for (int i = 0; i < head.Count; i++)
+                    head[i].Similarity = scores[i];
+
+                var reranked = head.OrderByDescending(h => h.Similarity).ToList();
+                reranked.AddRange(results.Skip(n));
+                return reranked;
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Reranker scoring failed, keeping original order: {ex.Message}");
+                return results;
+            }
         }
 
         /// <summary>
@@ -2417,6 +2467,7 @@ FROM embeddings WHERE RequestID = @RequestID";
             _queueSemaphore.Dispose();
             _cancellationTokenSource.Dispose();
             _embedder?.Dispose();
+            _reranker?.Dispose();
         }
 
         public async Task DisposeAsync()
@@ -2438,6 +2489,7 @@ FROM embeddings WHERE RequestID = @RequestID";
             _queueSemaphore.Dispose();
             _cancellationTokenSource.Dispose();
             _embedder?.Dispose();
+            _reranker?.Dispose();
         }
 
         #endregion

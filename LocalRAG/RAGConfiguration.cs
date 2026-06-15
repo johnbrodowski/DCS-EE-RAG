@@ -58,7 +58,10 @@ namespace LocalRAG
         /// Path to the BERT vocabulary file (vocab.txt). Should match the BERT model being used.
         /// </summary>
         //public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("Vocabularies", "base_uncased_large.txt"));
-        public int MaxSequenceLength { get; set; } = 256;
+        // GTE-small supports 512 tokens (~380 words). At 512 a full chat message or
+        // abstract is embedded without truncation; anything longer is covered by chunking
+        // (chunk-aware exact search), so no document content is lost at any length.
+        public int MaxSequenceLength { get; set; } = 512;
         public int WordsPerString { get; set; } = 40;
         public double OverlapPercentage { get; set; } = 25;
 
@@ -114,6 +117,20 @@ namespace LocalRAG
         /// very large corpora where a full scan is too slow.
         /// </summary>
         public bool UseExactVectorSearch { get; set; } = true;
+
+        /// <summary>
+        /// When true, a cross-encoder reranker re-scores the top
+        /// <see cref="RerankCandidateCount"/> retrieved candidates with full query-document
+        /// attention and reorders them. Sharpens top-rank precision; query-time only, no
+        /// re-embedding. Requires <see cref="RerankerModelPath"/>. Default off (opt-in).
+        /// </summary>
+        public bool UseReranker { get; set; } = false;
+
+        public string RerankerModelPath { get; set; } = GetAppPath(Path.Combine("ms-marco-MiniLM-L6-ONNX", "model_quantized.onnx"));
+        public string RerankerVocabPath { get; set; } = GetAppPath(Path.Combine("ms-marco-MiniLM-L6-ONNX", "vocab.txt"));
+
+        /// <summary>How many of the top fused candidates the reranker re-scores.</summary>
+        public int RerankCandidateCount { get; set; } = 20;
 
         /// <summary>
         /// Controls token-level fuzzy lexical matching (Jaro-Winkler scoring + prefix-
