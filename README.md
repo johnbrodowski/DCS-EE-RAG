@@ -62,6 +62,8 @@ similarity = intent_jaccard × 0.5 + dcn_jaccard × 0.3 + domain_jaccard × 0.2
 
 Retrieval accuracy is measured against [BEIR-SciFact](https://github.com/beir-cellar/beir) (scientific-claim verification) and an internal generated benchmark. Each query's relevant documents are known, so we report standard IR metrics at several cutoffs `k`.
 
+These results come from a compact **~33M-parameter** embedding model running locally on CPU — not a billion-parameter hosted retriever. Reaching near-perfect top-100 recall and ~97% top-5 recall at that size is what makes the approach practical to self-host.
+
 **Latest & best run — `scifact-chunks-lsh` (BEIR-SciFact test, 2026-06-15):**
 
 | Metric | @1 | @5 | @10 | @100 |
@@ -125,7 +127,7 @@ DCS-EE-RAG/
 ### Requirements
 
 - .NET 10 SDK
-- An ONNX BERT model (e.g. `all-MiniLM-L6-v2` from HuggingFace in ONNX format)
+- An ONNX sentence-embedding model with a BERT-WordPiece tokenizer and mean pooling. The default is **GTE-small** (int8 / AVX512-VNNI, ~33M params, 384-dim) — a drop-in upgrade over MiniLM that is markedly more accurate at roughly the same ingestion speed. Any MiniLM variant works too.
 - A matching vocabulary file (`vocab.txt`)
 
 ### Default Paths
@@ -133,8 +135,8 @@ DCS-EE-RAG/
 The system looks for model files relative to the application base directory:
 
 ```
-all-MiniLM-L6-v2-ONNX/model.onnx
-all-MiniLM-L6-v2-ONNX/vocab.txt
+gte-small/model_qint8_avx512_vnni.onnx
+gte-small/vocab.txt
 Database/Memory/FeedbackEmbeddings512.db   (created on first run)
 ```
 
