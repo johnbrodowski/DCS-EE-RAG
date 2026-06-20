@@ -58,6 +58,35 @@ similarity = intent_jaccard × 0.5 + dcn_jaccard × 0.3 + domain_jaccard × 0.2
 
 ---
 
+## Benchmark Results
+
+Retrieval accuracy is measured against [BEIR-SciFact](https://github.com/beir-cellar/beir) (scientific-claim verification) and an internal generated benchmark. Each query's relevant documents are known, so we report standard IR metrics at several cutoffs `k`.
+
+**Latest & best run — `scifact-chunks-lsh` (BEIR-SciFact test, 2026-06-15):**
+
+| Metric | @1 | @5 | @10 | @100 |
+|--------|----|----|-----|------|
+| **Recall** | 0.773 | 0.967 | 0.967 | **1.000** |
+| **Precision** | 0.833 | 0.233 | 0.117 | 0.012 |
+| **nDCG** | 0.833 | 0.898 | 0.898 | 0.905 |
+
+**MRR 0.876** · **Candidate recall 1.000** · **Negative false-positive rate 0.000** · 30 queries · ~21 s
+
+This run retrieves the correct supporting document within the top 5 for **96.7%** of queries, and within the top 100 for **100%** — with zero false positives on negative cases. Chunk-level indexing with LSH (`htables=10`, `hfuncs=8`, 40-word chunks, 25% overlap) drove the largest gains over the unchunked baseline.
+
+**Full-scale run — `scifact-gte-int8-item2` (300 queries):**
+
+| Metric | @1 | @5 | @10 | @100 |
+|--------|----|----|-----|------|
+| **Recall** | 0.583 | 0.746 | 0.806 | 0.930 |
+| **nDCG** | 0.610 | 0.684 | 0.705 | 0.733 |
+
+**MRR 0.682** · **Candidate recall 0.930** · 300 queries. At full corpus scale the system still surfaces the correct document in the top 100 for **93%** of queries.
+
+Raw per-run JSON and a consolidated `retrieval.csv` summary live in [`BenchmarkResults/`](BenchmarkResults/). See [`BENCHMARKING_EXPLAINED.md`](BENCHMARKING_EXPLAINED.md) for metric definitions and how to reproduce.
+
+---
+
 ## Project Structure
 
 ```
