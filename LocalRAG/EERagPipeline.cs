@@ -32,6 +32,65 @@ namespace LocalRAG
 
         /// <summary>True if the model elected at least one chunk for full retrieval.</summary>
         public bool RetrievalOccurred => ElectedIds.Count > 0;
+
+        /// <summary>True if the model asked for (and the system supplied) the next set of candidates.</summary>
+        public bool MoreRequested { get; init; }
+
+        /// <summary>Full record of this election, also persisted to the request's MetaData for review.</summary>
+        public ElectionTrace Election { get; init; } = new();
+    }
+
+    /// <summary>One candidate shown to the model, with the full entry a reviewer needs to judge the choice.</summary>
+    public sealed class ElectionProposal
+    {
+        public int Id { get; set; }
+        public string? RequestID { get; set; }
+        public double Similarity { get; set; }
+        /// <summary>1 = first set, 2 = the extra set supplied after a MORE request.</summary>
+        public int Batch { get; set; }
+        /// <summary>The line the model actually saw.</summary>
+        public string SummaryShown { get; set; } = string.Empty;
+        /// <summary>The whole entry (request, response, tool response), capped at <see cref="EERagPipeline.TraceTextCap"/> chars.</summary>
+        public string FullText { get; set; } = string.Empty;
+        public bool FullTextTruncated { get; set; }
+        /// <summary>True if DCS moved this candidate up the list.</summary>
+        public bool DcsBoosted { get; set; }
+    }
+
+    /// <summary>
+    /// Everything needed to review one election after the fact: what was proposed (in full, not just
+    /// the summaries), what the model said, what was chosen or refused, and what was injected.
+    /// </summary>
+    public sealed class ElectionTrace
+    {
+        public string RequestId { get; set; } = string.Empty;
+        public DateTime TimestampUtc { get; set; } = DateTime.UtcNow;
+        public string UserMessage { get; set; } = string.Empty;
+        public int TopK { get; set; }
+        public bool SilentMode { get; set; }
+
+        /// <summary>The DCN the query was attached to (null when there is no DCS or no matching thread).</summary>
+        public int? DcsQueryDcnId { get; set; }
+        public int DcsRelevantCount { get; set; }
+        public List<int> DcsBoostedIds { get; set; } = [];
+
+        public List<ElectionProposal> Proposed { get; set; } = [];
+        public bool MoreRequested { get; set; }
+        public int MoreAddedCount { get; set; }
+
+        /// <summary>Raw model replies in order: the election round(s) and nothing else.</summary>
+        public List<string> ModelReplies { get; set; } = [];
+        public List<int> ParsedIds { get; set; } = [];
+        public List<int> ElectedIds { get; set; } = [];
+        public List<int> RejectedIds { get; set; } = [];
+        public List<string> ElectedHashes { get; set; } = [];
+
+        /// <summary>none | full | silent: how the elected entries reached the model.</summary>
+        public string Injected { get; set; } = "none";
+        public int InjectedChars { get; set; }
+
+        /// <summary>answered-directly | elected | rejected-retry.</summary>
+        public string Outcome { get; set; } = "answered-directly";
     }
 
     /// <summary>
@@ -87,6 +146,14 @@ namespace LocalRAG
             // When a DCS assembler is provided, classify the user message and
             // use structured context routing to identify relevant message IDs.
             // These are used to boost/re-rank embedding search results.
+            var trace = new ElectionTrace
+            {
+                RequestId = requestId,
+                UserMessage = userMessage,
+                TopK = topK,
+                SilentMode = silentMode
+            };
+
             HashSet<string>? dcsRelevantIds = null;
             if (dcsAssembler != null)
             {
@@ -99,11 +166,13 @@ namespace LocalRAG
                 var queryDcn = dcsAssembler.FindMatchingDcn(queryKey);
                 if (queryDcn != null)
                     queryKey.DcnIds = new[] { queryDcn.DcnId };
+                trace.DcsQueryDcnId = queryDcn?.DcnId;
 
                 var dcsContext = dcsAssembler.AssembleContext(queryKey);
                 dcsRelevantIds = dcsContext
                     .Select(m => m.MessageId)
                     .ToHashSet();
+                trace.DcsRelevantCount = dcsRelevantIds.Count;
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > DCS assembled {dcsRelevantIds.Count} relevant context messages: [{string.Join(", ", dcsRelevantIds)}]");
             }
 
@@ -118,20 +187,28 @@ namespace LocalRAG
             var candidateDetails = string.Join(", ", candidates.Select(c => $"ID:{c.Id} sim={c.Similarity ?? 0:F3}"));
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 1: Found {candidates.Count} candidates: [{candidateDetails}]");
 
-            // When DCS provides relevant IDs, boost matching candidates to the top.
-            if (dcsRelevantIds != null && dcsRelevantIds.Count > 0)
+            // When DCS provides relevant IDs, boost matching candidates to the top. DCS only
+            // reorders what the search already returned; it never adds an entry of its own.
+            bool IsBoosted(FeedbackDatabaseValues c) =>
+                dcsRelevantIds != null && dcsRelevantIds.Contains(c.RequestID ?? "");
+
+            List<FeedbackDatabaseValues> Rank(List<FeedbackDatabaseValues> list)
             {
-                var boostedCount = candidates.Count(c => dcsRelevantIds.Contains(c.RequestID ?? ""));
-                candidates = candidates
-                    .OrderByDescending(c => dcsRelevantIds.Contains(c.RequestID ?? "") ? 1 : 0)
+                if (dcsRelevantIds == null || dcsRelevantIds.Count == 0) return list;
+                var boostedCount = list.Count(IsBoosted);
+                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > DCS boost reranking applied — {boostedCount} candidates boosted to top");
+                return list
+                    .OrderByDescending(c => IsBoosted(c) ? 1 : 0)
                     .ThenByDescending(c => c.Similarity ?? 0.0)
                     .ToList();
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 1: DCS boost reranking applied — {boostedCount} candidates boosted to top");
             }
+
+            candidates = Rank(candidates);
 
             // ── Step 2: Build summary list and candidate header ──────────────
             var candidateIds = candidates.Select(c => c.Id).ToList();
-            var candidateHeader = BuildCandidateHeader(candidates);
+            trace.Proposed.AddRange(candidates.Select(c => Propose(c, 1, IsBoosted(c))));
+            var candidateHeader = BuildCandidateHeader(candidates, offerMore: true);
 
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 2: Built candidate header ({candidates.Count} entries, {candidateHeader.Length} chars):");
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- CANDIDATE HEADER SENT TO MODEL ----");
@@ -158,6 +235,47 @@ namespace LocalRAG
             foreach (var line in firstResponse.Split('\n'))
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > {line}");
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- END MODEL FIRST RESPONSE ----");
+            trace.ModelReplies.Add(firstResponse);
+
+            // ── MORE: the next set of candidates, once, decided and run by the system ──
+            // The model can only ask; it cannot say how many or change any setting. The same
+            // search is repeated one set deeper (the similarity floor is already 0, so depth is
+            // the only thing left to widen) and everything is back to normal straight after.
+            if (IsMoreRequest(firstResponse))
+            {
+                session.TrimLastTurn(); // the bare "MORE" reply is not part of the conversation
+                trace.MoreRequested = true;
+
+                var deeper = await db.SearchEmbeddingsAsync(
+                    searchText: userMessage,
+                    topK: topK * 2,
+                    minimumSimilarity: 0.00f,
+                    searchLevel: 2);
+                var offered = candidateIds.ToHashSet();
+                var extra = Rank(deeper.Where(c => !offered.Contains(c.Id)).ToList())
+                    .Take(topK)
+                    .ToList();
+                trace.MoreAddedCount = extra.Count;
+                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > MORE requested — {extra.Count} further candidates: [{string.Join(", ", extra.Select(c => c.Id))}]");
+
+                candidates = candidates.Concat(extra).ToList();
+                candidateIds = candidates.Select(c => c.Id).ToList();
+                trace.Proposed.AddRange(extra.Select(c => Propose(c, 2, IsBoosted(c))));
+
+                candidateHeader = BuildCandidateHeader(
+                    candidates,
+                    offerMore: false,
+                    note: extra.Count == 0 ? "No further candidates exist." : "Further candidates have been added below.");
+
+                await db.UpdateRagCandidatesSurfacedAsync(requestId, candidateIds);
+
+                var secondMsg = await session.SendWithTransientBackgroundAsync(
+                    userMessage,
+                    candidateHeader,
+                    cancellationToken: cancellationToken);
+                firstResponse = secondMsg.Content;
+                trace.ModelReplies.Add(firstResponse);
+            }
 
             // ── Step 6: Parse RETRIEVE command ───────────────────────────────
             // Constrain to surfaced candidates — prevents a malformed or prompt-injected
@@ -181,10 +299,12 @@ namespace LocalRAG
             string finalResponse;
             var electedHashes = new List<string>();
 
-            if (electedIds.Count == 0 && rawElectedIds.Count > 0)
+            if (electedIds.Count == 0 && (rawElectedIds.Count > 0 || IsMoreRequest(firstResponse)))
             {
-                // The model asked for entries that were never offered. The command is not an
-                // answer: drop that turn from history and ask again with nothing to retrieve.
+                // The model asked for entries that were never offered (or asked for MORE a
+                // second time, which is refused). The command is not an answer: drop that turn
+                // from history and ask again with nothing to retrieve.
+                trace.Outcome = "rejected-retry";
                 session.TrimLastTurn();
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Retrieval request rejected — re-asking for a direct answer");
                 var retry = await session.SendWithTransientBackgroundAsync(
@@ -249,6 +369,10 @@ namespace LocalRAG
                     Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 7: Built transient context (silentMode=false, full chunks, {transientContext.Length} chars)");
                 }
 
+                trace.Outcome = "elected";
+                trace.Injected = silentMode ? "silent" : "full";
+                trace.InjectedChars = transientContext.Length;
+
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- TRANSIENT CONTEXT SENT TO MODEL ----");
                 foreach (var line in transientContext.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > {line}");
@@ -279,6 +403,15 @@ namespace LocalRAG
             await db.UpdateRagEntriesElectedAsync(requestId, electedHashes);
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 9: Phase 2 audit written — elected hashes: [{string.Join(", ", electedHashes)}]");
 
+            // Election record for review: proposed (in full), replies, choice, injection.
+            trace.ParsedIds = rawElectedIds;
+            trace.ElectedIds = electedIds;
+            trace.RejectedIds = rejectedIds;
+            trace.ElectedHashes = electedHashes;
+            trace.DcsBoostedIds = trace.Proposed.Where(p => p.DcsBoosted).Select(p => p.Id).ToList();
+            await db.UpdateRagElectionLogAsync(requestId, trace);
+            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Election log written — outcome={trace.Outcome}, proposed={trace.Proposed.Count}, more={trace.MoreRequested}");
+
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > === EE-RAG Pipeline Complete ===");
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Candidates surfaced: {candidateIds.Count}, Elected: {electedIds.Count}, Retrieval: {(electedIds.Count > 0 ? "yes" : "no")}");
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Final response: {finalResponse.Length} chars");
@@ -290,7 +423,9 @@ namespace LocalRAG
                 FirstResponse        = firstResponse,
                 CandidateIdsSurfaced = candidateIds,
                 ElectedIds           = electedIds,
-                ElectedHashes        = electedHashes
+                ElectedHashes        = electedHashes,
+                MoreRequested        = trace.MoreRequested,
+                Election             = trace
             };
         }
 
@@ -311,7 +446,8 @@ namespace LocalRAG
         /// without being flooded with full chunk content.
         /// Falls back to the first 150 characters of Request when Summary is absent.
         /// </summary>
-        public static string BuildCandidateHeader(List<FeedbackDatabaseValues> candidates)
+        public static string BuildCandidateHeader(
+            List<FeedbackDatabaseValues> candidates, bool offerMore = false, string? note = null)
         {
             var sb = new StringBuilder();
             sb.AppendLine("--- Potentially Relevant Context ---");
@@ -321,19 +457,58 @@ namespace LocalRAG
             sb.AppendLine("You MUST use the exact number shown in [ID:<number>] — do not renumber the entries yourself.");
             sb.AppendLine("For multiple entries: RETRIEVE <id1> <id2> (space-separated).");
             sb.AppendLine("You are not required to retrieve any entry.");
+            if (offerMore)
+                sb.AppendLine("If none of these look relevant, you may respond with EXACTLY: MORE (once only) to be shown the next set of candidates.");
+            if (!string.IsNullOrEmpty(note))
+                sb.AppendLine(note);
             sb.AppendLine("---");
 
             foreach (var c in candidates)
-            {
-                // Prefer the pre-generated Summary field; fall back to the first ~150 chars of Request.
-                var summaryText = !string.IsNullOrWhiteSpace(c.Summary)
-                    ? c.Summary.Trim()
-                    : TruncateToTokenBudget(c.Request ?? string.Empty, 150);
-
-                sb.AppendLine($"[ID:{c.Id}] {summaryText}");
-            }
+                sb.AppendLine($"[ID:{c.Id}] {SummaryText(c)}");
 
             return sb.ToString();
+        }
+
+        /// <summary>The one-line summary the model sees: the stored Summary, else the start of the Request.</summary>
+        private static string SummaryText(FeedbackDatabaseValues c) =>
+            !string.IsNullOrWhiteSpace(c.Summary)
+                ? c.Summary.Trim()
+                : TruncateToTokenBudget(c.Request ?? string.Empty, 150);
+
+        /// <summary>
+        /// True when the whole reply is the bare word MORE (case-insensitive, trailing punctuation allowed).
+        /// It takes no parameters, so the model cannot choose how much it gets or change any setting.
+        /// </summary>
+        public static bool IsMoreRequest(string response) =>
+            !string.IsNullOrWhiteSpace(response) &&
+            Regex.IsMatch(response, @"^\s*MORE\s*[.!]?\s*$", RegexOptions.IgnoreCase);
+
+        /// <summary>Longest entry text kept in the election trace (the full entry stays in the database).</summary>
+        public const int TraceTextCap = 8000;
+
+        private static string FullEntryText(FeedbackDatabaseValues c)
+        {
+            var sb = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(c.Request)) sb.AppendLine($"Request: {c.Request}");
+            if (!string.IsNullOrWhiteSpace(c.TextResponse)) sb.AppendLine($"Response: {c.TextResponse}");
+            if (!string.IsNullOrWhiteSpace(c.ToolUseTextResponse)) sb.AppendLine($"Tool Response: {c.ToolUseTextResponse}");
+            return sb.ToString().TrimEnd();
+        }
+
+        private static ElectionProposal Propose(FeedbackDatabaseValues c, int batch, bool boosted)
+        {
+            var full = FullEntryText(c);
+            return new ElectionProposal
+            {
+                Id = c.Id,
+                RequestID = c.RequestID,
+                Similarity = c.Similarity ?? 0.0,
+                Batch = batch,
+                SummaryShown = SummaryText(c),
+                FullText = full.Length > TraceTextCap ? full[..TraceTextCap] : full,
+                FullTextTruncated = full.Length > TraceTextCap,
+                DcsBoosted = boosted
+            };
         }
 
         // ── Utility: RETRIEVE command parser (Layer 2) ───────────────────────

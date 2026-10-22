@@ -767,6 +767,39 @@ END;
             InvalidateCache(requestId);
         }
 
+        /// <summary>
+        /// Stores the full election record (what was proposed, the model's replies, what was chosen
+        /// and injected) under MetaData["RagElectionLog"] so a reviewer, human or AI, can judge it
+        /// from the whole retrieval and not just the summaries. Replaces any earlier record.
+        /// </summary>
+        public async Task UpdateRagElectionLogAsync(string requestId, ElectionTrace trace)
+        {
+            if (string.IsNullOrEmpty(requestId)) return;
+
+            using var connection = await GetConnectionAsync();
+
+            const string readQuery = "SELECT MetaData FROM embeddings WHERE RequestID = @RequestID";
+            using var readCmd = new SqliteCommand(readQuery, connection);
+            readCmd.Parameters.AddWithValue("@RequestID", requestId);
+            var raw = (await readCmd.ExecuteScalarAsync()) as string;
+
+            var meta = string.IsNullOrWhiteSpace(raw)
+                ? new Dictionary<string, object?>()
+                : Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object?>>(raw)
+                  ?? new Dictionary<string, object?>();
+
+            meta["RagElectionLog"] = trace;
+
+            const string writeQuery = "UPDATE embeddings SET MetaData = @MetaData WHERE RequestID = @RequestID";
+            using var writeCmd = new SqliteCommand(writeQuery, connection);
+            writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
+            writeCmd.Parameters.AddWithValue("@RequestID", requestId);
+            if (await writeCmd.ExecuteNonQueryAsync() == 0)
+                LogMessage($"RAG election log not recorded: no row with RequestID '{requestId}'.");
+
+            InvalidateCache(requestId);
+        }
+
         public async Task<List<(string request, string textResponse, string toolUseTextResponse, string toolContent, string toolResult, string requestID)>>
             GetConversationHistoryAsync(int messageCount = 100)
         {

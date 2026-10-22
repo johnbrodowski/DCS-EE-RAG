@@ -34,6 +34,10 @@ Layer 5  Silent digestion (optional)  Chunks distilled to synthesis before injec
 
 Each elected chunk is tagged with an 8-hex embedding hash (`[RAG:a3f9b2c1]`) for deterministic audit without semantic pollution.
 
+**More candidates, once.** If none of the first `topK` summaries look relevant the model may reply with the bare word `MORE`. The system then repeats the same search one set deeper and shows the next `topK` entries. The model cannot choose the number or change any setting (`MORE 50` is not a request), it can ask only once, and the next turn is back to normal.
+
+**Election log.** Every run stores an `ElectionTrace` under `MetaData["RagElectionLog"]` on the request's row, and returns it as `EERagResult.Election`: every proposed entry in full (capped at 8,000 characters, flagged if cut) beside the summary the model saw, the model's raw replies, the ids chosen or refused, what was injected, and what DCS did (query thread, boosted ids). It is written so a human or an AI reviewer can judge the choice from the whole retrieval. DCS only reorders the search's own candidates; it never adds an entry or any text of its own.
+
 ### DCS: Structured Context Routing
 
 Instead of embedding similarity alone, DCS routes context through a three-level identifier hierarchy:

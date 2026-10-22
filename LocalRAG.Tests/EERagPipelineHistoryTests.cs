@@ -93,8 +93,16 @@ public class EERagPipelineHistoryTests : IAsyncLifetime
         return $"RETRIEVE {m.Groups[1].Value}";
     }
 
-    private Task<EERagResult> Run(ScriptedSession s, string message = Question) =>
-        EERagPipeline.RunPipelineAsync(message, "cur", s, _db!, topK: 5);
+    private Task<EERagResult> Run(ScriptedSession s, string message = Question, int topK = 5,
+        DcsContextAssembler? dcs = null) =>
+        EERagPipeline.RunPipelineAsync(message, "cur", s, _db!, topK: topK, dcsAssembler: dcs);
+
+    private static List<int> HeaderIds(IReadOnlyList<ChatMessage> call) =>
+        Regex.Matches(call.First(m => m.Role == ChatRole.System && m.Content.Contains("[ID:")).Content, @"\[ID:(\d+)\]")
+            .Select(m => int.Parse(m.Groups[1].Value)).ToList();
+
+    private async Task<Newtonsoft.Json.Linq.JObject> MetaOf(string requestId) =>
+        Newtonsoft.Json.Linq.JObject.Parse((await _db!.GetFeedbackDataByRequestIdAsync(requestId))?.MetaData ?? "{}");
 
     // ── Tests ───────────────────────────────────────────────────────────────
 
@@ -196,6 +204,223 @@ public class EERagPipelineHistoryTests : IAsyncLifetime
         Assert.DoesNotContain("RETRIEVE", Flat(s.Messages));
         Assert.DoesNotContain("Potentially Relevant Context", Flat(s.Calls[^1]));
         Assert.Equal(3, s.Messages.Count);
+    }
+
+    // ── MORE: the next set of candidates, once, controlled by the system ─────
+
+    [Theory]
+    [InlineData("MORE", true)]
+    [InlineData("more.", true)]
+    [InlineData("  MORE \n", true)]
+    [InlineData("MORE 50", false)]
+    [InlineData("MORE topK=100", false)]
+    [InlineData("More information is available.", false)]
+    [InlineData("RETRIEVE 3", false)]
+    [InlineData("", false)]
+    public void IsMoreRequest_AcceptsOnlyTheBareWord(string reply, bool expected) =>
+        Assert.Equal(expected, EERagPipeline.IsMoreRequest(reply));
+
+    [SkippableFact]
+    public async Task More_ShowsTheNextSet_ThenElectsFromIt_AndLeavesNoTrace()
+    {
+        Skip.If(_db == null, "BERT model not configured. Set BERT_MODEL_PATH.");
+        ScriptedSession? self = null;
+        var s = new ScriptedSession((i, msgs) =>
+        {
+            if (i == 0) return "MORE";
+            if (i == 1) // elect something that was NOT in the first set
+            {
+                var first = HeaderIds(self!.Calls[0]);
+                var added = HeaderIds(msgs).First(id => !first.Contains(id));
+                return $"RETRIEVE {added}";
+            }
+            return i == 2 ? "Answer from the extra set." : "Plain answer.";
+        });
+        self = s;
+
+        var result = await Run(s, topK: 2);
+
+        Assert.Equal(3, s.Calls.Count);
+
+        // Call 0: two candidates and the offer of MORE.
+        Assert.Equal(2, HeaderIds(s.Calls[0]).Count);
+        Assert.Contains("respond with EXACTLY: MORE", Flat(s.Calls[0]));
+
+        // Call 1: the same two plus the next two; no second MORE offered; the bare MORE reply is gone.
+        var h1 = HeaderIds(s.Calls[1]);
+        Assert.Equal(4, h1.Count);
+        Assert.Contains("Further candidates have been added below.", Flat(s.Calls[1]));
+        Assert.DoesNotContain("respond with EXACTLY: MORE", Flat(s.Calls[1]));
+        Assert.DoesNotContain(s.Calls[1], m => m.Role == ChatRole.Assistant);
+        Assert.Single(s.Calls[1], m => m.Role == ChatRole.User);
+
+        // Call 2: just the elected entry; history is a clean pair.
+        Assert.Equal(3, s.Messages.Count);
+        Assert.DoesNotContain("MORE", Flat(s.Messages.Where(m => m.Role != ChatRole.System)));
+        Assert.True(result.MoreRequested);
+        Assert.Equal(2, result.Election.MoreAddedCount);
+        Assert.Equal(2, result.Election.Proposed.Count(p => p.Batch == 1));
+        Assert.Equal(2, result.Election.Proposed.Count(p => p.Batch == 2));
+        Assert.All(result.ElectedIds, id => Assert.Contains(result.Election.Proposed, p => p.Id == id && p.Batch == 2));
+
+        // The audit lists all four surfaced ids, including the added ones.
+        var surfaced = (await MetaOf("cur"))["RagCandidatesSurfaced"]!.Select(t => (int)t).ToList();
+        Assert.Equal(h1.OrderBy(x => x), surfaced.OrderBy(x => x));
+
+        // Back to normal right after: the next turn gets a normal-size list and MORE is on offer again.
+        await Run(s, "What does git do?", topK: 2);
+        Assert.Equal(2, HeaderIds(s.Calls[3]).Count);
+        Assert.Contains("respond with EXACTLY: MORE", Flat(s.Calls[3]));
+    }
+
+    [SkippableFact]
+    public async Task More_CannotBeParameterised_OrUsedTwice()
+    {
+        Skip.If(_db == null, "BERT model not configured. Set BERT_MODEL_PATH.");
+
+        // "MORE 50" is not a request: no widening happens, one call only.
+        var a = new ScriptedSession((_, _) => "MORE 50");
+        var ra = await Run(a, topK: 2);
+        Assert.Single(a.Calls);
+        Assert.False(ra.MoreRequested);
+        Assert.Equal(2, HeaderIds(a.Calls[0]).Count);
+
+        // A second bare MORE is refused and the model is asked for a direct answer.
+        var b = new ScriptedSession((i, _) => i < 2 ? "MORE" : "Direct answer.");
+        var rb = await Run(b, topK: 2);
+        Assert.Equal(3, b.Calls.Count);
+        Assert.Equal("Direct answer.", rb.FinalResponse);
+        Assert.Equal("rejected-retry", rb.Election.Outcome);
+        Assert.Equal(3, b.Messages.Count);
+        Assert.DoesNotContain("MORE", Flat(b.Messages.Where(m => m.Role != ChatRole.System)));
+        Assert.DoesNotContain("Potentially Relevant Context", Flat(b.Calls[2]));
+    }
+
+    // ── Election log: enough for a reviewer to judge the choice ──────────────
+
+    [SkippableFact]
+    public async Task ElectionLog_RecordsProposedInFull_Replies_Choice_AndInjection()
+    {
+        Skip.If(_db == null, "BERT model not configured. Set BERT_MODEL_PATH.");
+        await _db!.AddRequestToEmbeddingDatabaseAsync("long", string.Concat(Enumerable.Repeat("alpha beta ", 1000)), embed: true);
+        var s = new ScriptedSession((i, msgs) => i == 0 ? Elect(msgs, "Kubernetes") : "Use Kubernetes.");
+
+        var result = await Run(s);
+
+        var log = (await MetaOf("cur"))["RagElectionLog"]!;
+        Assert.Equal("elected", (string)log["Outcome"]!);
+        Assert.Equal(Question, (string)log["UserMessage"]!);
+        Assert.Equal("full", (string)log["Injected"]!);
+        Assert.True((int)log["InjectedChars"]! > Kube.Length);
+        Assert.StartsWith("RETRIEVE ", (string)log["ModelReplies"]![0]!);
+        Assert.Equal(result.ElectedIds.Single(), (int)log["ElectedIds"]![0]!);
+
+        // Every proposed entry is there with its whole text, not just the summary the model saw.
+        var proposed = log["Proposed"]!.ToList();
+        Assert.True(proposed.Count >= 4);
+        var kube = proposed.Single(p => ((string)p["FullText"]!).Contains(Kube));
+        Assert.Contains("Kubernetes", (string)kube["SummaryShown"]!);
+        Assert.Contains("Request: " + Kube, (string)kube["FullText"]!);
+        Assert.Contains(proposed, p => ((string)p["FullText"]!).Contains(Pg));
+        Assert.Contains(proposed, p => ((string)p["FullText"]!).Contains(Git));
+
+        // Long entries are capped in the log and flagged, not silently cut.
+        var big = proposed.Single(p => (string)p["RequestID"]! == "long");
+        Assert.True((bool)big["FullTextTruncated"]!);
+        Assert.Equal(EERagPipeline.TraceTextCap, ((string)big["FullText"]!).Length);
+        Assert.Equal(result.Election.Proposed.Count, proposed.Count);
+    }
+
+    [SkippableFact]
+    public async Task ElectionLog_RecordsRejectedAndDirectOutcomes()
+    {
+        Skip.If(_db == null, "BERT model not configured. Set BERT_MODEL_PATH.");
+
+        var rej = new ScriptedSession((i, _) => i == 0 ? "RETRIEVE 987654" : "Direct answer.");
+        var r1 = await Run(rej);
+        Assert.Equal("rejected-retry", r1.Election.Outcome);
+        Assert.Equal(new[] { 987654 }, r1.Election.RejectedIds);
+        Assert.Equal("none", r1.Election.Injected);
+        Assert.Equal(new[] { "RETRIEVE 987654" }, r1.Election.ModelReplies);
+
+        var direct = new ScriptedSession((_, _) => "Just answering.");
+        var r2 = await Run(direct);
+        Assert.Equal("answered-directly", r2.Election.Outcome);
+        Assert.Empty(r2.Election.ElectedIds);
+        Assert.Equal("answered-directly", (string)(await MetaOf("cur"))["RagElectionLog"]!["Outcome"]!);
+    }
+
+    // ── DCS continuity: reorders the search's own candidates, never injects ──
+
+    [SkippableFact]
+    public async Task Dcs_OnlyReordersSearchCandidates_AndInjectsNothingOfItsOwn()
+    {
+        Skip.If(_db == null, "BERT model not configured. Set BERT_MODEL_PATH.");
+
+        var key = DcsIntentClassifier.Classify(Question);
+        var dcs = new DcsContextAssembler();
+        var thread = dcs.FindOrCreateDcn(key);
+        // One real row ("pg") that DCS considers part of the thread, registered first so the
+        // 20-per-thread cap keeps it, then thirty highly relevant "ghost" messages that are
+        // not in the search results at all.
+        dcs.RegisterMessage(new DcsMessageRecord
+        {
+            MessageId = "pg", Key = new DcsKey { IntentIds = key.IntentIds, DomainIds = key.DomainIds, DcnIds = [thread.DcnId] },
+            HardLinkedDcns = [thread.DcnId], Content = "GHOST-SECRET-pg"
+        });
+        for (int i = 0; i < 30; i++)
+            dcs.RegisterMessage(new DcsMessageRecord
+            {
+                MessageId = $"ghost-{i}", Key = new DcsKey { IntentIds = key.IntentIds, DomainIds = key.DomainIds, DcnIds = [thread.DcnId] },
+                HardLinkedDcns = [thread.DcnId], Content = $"GHOST-SECRET-{i}"
+            });
+        var stamp = thread.LastReferencedUtc;
+        var dcnCount = dcs.DcnStore.Count;
+        var msgCount = dcs.MessageStore.Count;
+
+        var plain = new ScriptedSession((_, _) => "ok");
+        await Run(plain);
+
+        var withDcs = new ScriptedSession((i, msgs) => i == 0 ? Elect(msgs, "Kubernetes") : "Use Kubernetes.");
+        var result = await Run(withDcs, dcs: dcs);
+
+        // Same candidates as without DCS; only the order may differ.
+        Assert.Equal(HeaderIds(plain.Calls[0]).OrderBy(x => x), HeaderIds(withDcs.Calls[0]).OrderBy(x => x));
+
+        // Nothing from DCS itself reaches the model, on either call.
+        Assert.DoesNotContain("GHOST-SECRET", Flat(withDcs.Calls.SelectMany(c => c)));
+
+        // The one boosted candidate led the list; it was not injected because it was not elected.
+        var pgId = result.Election.Proposed.Single(p => p.RequestID == "pg").Id;
+        Assert.Equal(pgId, HeaderIds(withDcs.Calls[0])[0]);
+        Assert.Equal(new[] { pgId }, result.Election.DcsBoostedIds);
+        Assert.Equal(thread.DcnId, result.Election.DcsQueryDcnId);
+        Assert.DoesNotContain(Pg, Flat(withDcs.Calls[1]));
+        Assert.Contains(Kube, Flat(withDcs.Calls[1]));
+
+        // Querying left DCS state exactly as it was.
+        Assert.Equal(dcnCount, dcs.DcnStore.Count);
+        Assert.Equal(msgCount, dcs.MessageStore.Count);
+        Assert.Equal(stamp, thread.LastReferencedUtc);
+    }
+
+    [SkippableFact]
+    public async Task Dcs_AbsentOrUnmatched_ChangesNothing()
+    {
+        Skip.If(_db == null, "BERT model not configured. Set BERT_MODEL_PATH.");
+
+        var s = new ScriptedSession((_, _) => "ok");
+        var none = await Run(s);
+        Assert.Null(none.Election.DcsQueryDcnId);
+        Assert.Equal(0, none.Election.DcsRelevantCount);
+        Assert.Empty(none.Election.DcsBoostedIds);
+
+        var empty = new DcsContextAssembler();
+        var s2 = new ScriptedSession((_, _) => "ok");
+        var r = await Run(s2, dcs: empty);
+        Assert.Empty(r.Election.DcsBoostedIds);
+        Assert.Equal(HeaderIds(s.Calls[0]), HeaderIds(s2.Calls[0])); // identical order too
+        Assert.Empty(empty.DcnStore);                                 // the query created nothing
     }
 
     [SkippableFact]
