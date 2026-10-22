@@ -181,7 +181,19 @@ namespace LocalRAG
             string finalResponse;
             var electedHashes = new List<string>();
 
-            if (electedIds.Count == 0)
+            if (electedIds.Count == 0 && rawElectedIds.Count > 0)
+            {
+                // The model asked for entries that were never offered. The command is not an
+                // answer: drop that turn from history and ask again with nothing to retrieve.
+                session.TrimLastTurn();
+                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Retrieval request rejected — re-asking for a direct answer");
+                var retry = await session.SendWithTransientBackgroundAsync(
+                    userMessage,
+                    "No additional context is available for this request. Answer directly; do not ask to retrieve anything.",
+                    cancellationToken: cancellationToken);
+                finalResponse = retry.Content;
+            }
+            else if (electedIds.Count == 0)
             {
                 // No retrieval requested — first response is the final response.
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > No retrieval — using first response as final");
