@@ -121,15 +121,19 @@ namespace LocalRAG
                     continue;
                 }
 
-                // Apply DCN recency decay
-                double decayMultiplier = 1.0;
+                // Apply DCN recency decay: the freshest linked DCN governs. A message with
+                // no known DCN is not decayed.
+                double decayMultiplier = 0.0;
+                bool hasDcn = false;
                 foreach (var dcnId in msg.HardLinkedDcns)
                 {
                     if (_dcnStore.TryGetValue(dcnId, out var dcn))
                     {
+                        hasDcn = true;
                         decayMultiplier = Math.Max(decayMultiplier, dcn.ComputeRecencyWeight());
                     }
                 }
+                if (!hasDcn) decayMultiplier = 1.0;
 
                 var finalScore = similarity * decayMultiplier;
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Assemble >   {msg.MessageId}: similarity={similarity:F3} x decay={decayMultiplier:F3} -> score={finalScore:F3}");
@@ -195,11 +199,41 @@ namespace LocalRAG
         /// </summary>
         public DcnNode FindOrCreateDcn(DcsKey key)
         {
+            var bestMatch = FindBestDcn(key, out var bestScore);
+
+            if (bestMatch != null)
+            {
+                bestMatch.TouchReference();
+                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > Matched existing DCN {bestMatch.DcnId} (score={bestScore:F3})");
+                return bestMatch;
+            }
+
+            // Create new DCN
+            var newDcn = new DcnNode
+            {
+                DcnId = _nextDcnId++,
+                TopicIdentifiers = key.IntentIds.Concat(key.DomainIds).Distinct().ToArray()
+            };
+
+            _dcnStore[newDcn.DcnId] = newDcn;
+            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > No match above threshold {ELIGIBILITY_THRESHOLD}, creating new DCN {newDcn.DcnId} with topics=[{string.Join(",", newDcn.TopicIdentifiers)}]");
+            return newDcn;
+        }
+
+        /// <summary>
+        /// Finds the existing DCN that best matches the key, or null. Unlike
+        /// <see cref="FindOrCreateDcn"/> it neither creates a DCN nor touches one, so a
+        /// retrieval query can pick up its continuity thread without altering DCS state.
+        /// </summary>
+        public DcnNode? FindMatchingDcn(DcsKey key) => FindBestDcn(key, out _);
+
+        private DcnNode? FindBestDcn(DcsKey key, out double bestScore)
+        {
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > Searching {_dcnStore.Count} existing DCNs for match...");
 
             // Try to find a matching DCN
             DcnNode? bestMatch = null;
-            double bestScore = 0;
+            bestScore = 0;
 
             foreach (var dcn in _dcnStore.Values)
             {
@@ -222,23 +256,7 @@ namespace LocalRAG
                 }
             }
 
-            if (bestMatch != null)
-            {
-                bestMatch.TouchReference();
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > Matched existing DCN {bestMatch.DcnId} (score={bestScore:F3})");
-                return bestMatch;
-            }
-
-            // Create new DCN
-            var newDcn = new DcnNode
-            {
-                DcnId = _nextDcnId++,
-                TopicIdentifiers = key.IntentIds.Concat(key.DomainIds).Distinct().ToArray()
-            };
-
-            _dcnStore[newDcn.DcnId] = newDcn;
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > No match above threshold {ELIGIBILITY_THRESHOLD}, creating new DCN {newDcn.DcnId} with topics=[{string.Join(",", newDcn.TopicIdentifiers)}]");
-            return newDcn;
+            return bestMatch;
         }
 
         /// <summary>

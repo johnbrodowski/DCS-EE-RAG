@@ -51,8 +51,8 @@ namespace LocalRAG
         // pipeline, chunks-off) it lifted nDCG@10 0.544 -> 0.705 over MiniLM at ~the same
         // ingestion speed (int8 VNNI). MIT-licensed. The int8 variant trades ~0.01 nDCG
         // vs fp32 for ~1.7x faster inference on VNNI-capable CPUs.
-        public string ModelPath { get; set; } = GetAppPath(Path.Combine("gte-small", "model_qint8_avx512_vnni.onnx"));
-        public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("gte-small", "vocab.txt"));
+        public string ModelPath { get; set; } = GetAppPath(Path.Combine("model", "model_qint8_avx512_vnni.onnx"));
+        public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("model", "vocab.txt"));
 
         /// <summary>
         /// Path to the BERT vocabulary file (vocab.txt). Should match the BERT model being used.

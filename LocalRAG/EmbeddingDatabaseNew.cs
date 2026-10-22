@@ -714,7 +714,8 @@ END;
             const string readQuery = "SELECT MetaData FROM embeddings WHERE RequestID = @RequestID";
             using var readCmd = new SqliteCommand(readQuery, connection);
             readCmd.Parameters.AddWithValue("@RequestID", requestId);
-            var raw = (string?)await readCmd.ExecuteScalarAsync();
+            // DBNull (NULL MetaData) or null (no such row) both read back as a null string.
+            var raw = (await readCmd.ExecuteScalarAsync()) as string;
 
             var meta = string.IsNullOrWhiteSpace(raw)
                 ? new Dictionary<string, object?>()
@@ -727,7 +728,8 @@ END;
             using var writeCmd = new SqliteCommand(writeQuery, connection);
             writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
             writeCmd.Parameters.AddWithValue("@RequestID", requestId);
-            await writeCmd.ExecuteNonQueryAsync();
+            if (await writeCmd.ExecuteNonQueryAsync() == 0)
+                LogMessage($"RAG audit not recorded: no row with RequestID '{requestId}'.");
 
             InvalidateCache(requestId);
         }
@@ -746,7 +748,7 @@ END;
             const string readQuery = "SELECT MetaData FROM embeddings WHERE RequestID = @RequestID";
             using var readCmd = new SqliteCommand(readQuery, connection);
             readCmd.Parameters.AddWithValue("@RequestID", requestId);
-            var raw = (string?)await readCmd.ExecuteScalarAsync();
+            var raw = (await readCmd.ExecuteScalarAsync()) as string;
 
             var meta = string.IsNullOrWhiteSpace(raw)
                 ? new Dictionary<string, object?>()
@@ -759,7 +761,8 @@ END;
             using var writeCmd = new SqliteCommand(writeQuery, connection);
             writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
             writeCmd.Parameters.AddWithValue("@RequestID", requestId);
-            await writeCmd.ExecuteNonQueryAsync();
+            if (await writeCmd.ExecuteNonQueryAsync() == 0)
+                LogMessage($"RAG audit not recorded: no row with RequestID '{requestId}'.");
 
             InvalidateCache(requestId);
         }
