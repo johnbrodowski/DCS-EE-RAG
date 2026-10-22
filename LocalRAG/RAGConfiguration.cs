@@ -119,6 +119,15 @@ namespace LocalRAG
         public bool UseExactVectorSearch { get; set; } = true;
 
         /// <summary>
+        /// When true, an extra hash-bucket "memory" channel is fused into the search alongside
+        /// the vector and keyword channels. Default off: it probes only 3 of 256 buckets, so on a
+        /// 5,000-document corpus it returned about one result per query (recall@100 ≈ 0.10) and
+        /// each hit cost a full-table text lookup, while the exact vector channel already covers
+        /// every document. When off, texts are not added to the memory index either.
+        /// </summary>
+        public bool UseMemoryChannel { get; set; } = false;
+
+        /// <summary>
         /// When true, a cross-encoder reranker re-scores the top
         /// <see cref="RerankCandidateCount"/> retrieved candidates with full query-document
         /// attention and reorders them. Sharpens top-rank precision; query-time only, no

@@ -151,12 +151,14 @@ namespace LocalRAG
             var embeddings = ExtractMeanEmbedding(tensor, attentionMask);
             var normalizedEmbeddings = Normalize(embeddings);
 
-            // Store in memory index for similarity search
-            await _memoryIndex.AddOrUpdateAsync(
-                id: Guid.NewGuid().ToString(),
-                vector: normalizedEmbeddings,
-                tags: new Dictionary<string, string> { { "text", textToEmbed } }
-            );
+            // Store in memory index for similarity search (only when that channel is enabled;
+            // otherwise every text and query would pile up in an index nothing reads).
+            if (_config.UseMemoryChannel)
+                await _memoryIndex.AddOrUpdateAsync(
+                    id: Guid.NewGuid().ToString(),
+                    vector: normalizedEmbeddings,
+                    tags: new Dictionary<string, string> { { "text", textToEmbed } }
+                );
 
             return normalizedEmbeddings;
         }
@@ -338,10 +340,11 @@ namespace LocalRAG
                 var normalized = Normalize(pooled);
                 list.Add(normalized);
 
-                await _memoryIndex.AddOrUpdateAsync(
-                    id: Guid.NewGuid().ToString(),
-                    vector: normalized,
-                    tags: new Dictionary<string, string> { { "text", raw[r] } });
+                if (_config.UseMemoryChannel)
+                    await _memoryIndex.AddOrUpdateAsync(
+                        id: Guid.NewGuid().ToString(),
+                        vector: normalized,
+                        tags: new Dictionary<string, string> { { "text", raw[r] } });
             }
 
             return list;

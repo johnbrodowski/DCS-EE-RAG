@@ -190,7 +190,9 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_requestid ON embeddings(RequestID);
 CREATE INDEX IF NOT EXISTS idx_embeddings_timestamp ON embeddings(Timestamp);
 ";
 
-            // FTS5 virtual table for full-text search (shadows main table)
+            // FTS5 virtual table for full-text search (shadows main table). The porter tokenizer
+            // stems words ("inhibits"/"inhibiting" -> "inhibit"); on SciFact that took BM25 from
+            // 0.665 to 0.681 nDCG@10. Databases created before this are migrated below.
             const string createFtsTable = @"
 CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_fts USING fts5(
     RequestID,
@@ -199,7 +201,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_fts USING fts5(
     ToolUseTextResponse,
     Summary,
     content='embeddings',
-    content_rowid='Id'
+    content_rowid='Id',
+    tokenize='porter unicode61'
 );
 ";
 
@@ -264,11 +267,32 @@ END;
                 using (var cmd = new SqliteCommand(createMainTable, connection, transaction))
                     await cmd.ExecuteNonQueryAsync();
 
+                // An index made before stemming existed has the default tokenizer. Drop it so it
+                // is recreated with porter below and refilled from the content table (the
+                // triggers refer to it by name and keep working).
+                bool rebuildFts = false;
+                using (var cmd = new SqliteCommand(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'embeddings_fts'", connection, transaction))
+                {
+                    var ddl = await cmd.ExecuteScalarAsync() as string;
+                    if (ddl != null && !ddl.Contains("porter", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var drop = new SqliteCommand("DROP TABLE embeddings_fts", connection, transaction);
+                        await drop.ExecuteNonQueryAsync();
+                        rebuildFts = true;
+                        LogMessage("Full-text index upgraded to the porter (stemming) tokenizer; rebuilding it from existing rows.");
+                    }
+                }
+
                 using (var cmd = new SqliteCommand(createFtsTable, connection, transaction))
                     await cmd.ExecuteNonQueryAsync();
 
                 using (var cmd = new SqliteCommand(createTriggers, connection, transaction))
                     await cmd.ExecuteNonQueryAsync();
+
+                if (rebuildFts)
+                    using (var cmd = new SqliteCommand("INSERT INTO embeddings_fts(embeddings_fts) VALUES('rebuild');", connection, transaction))
+                        await cmd.ExecuteNonQueryAsync();
 
                 transaction.Commit();
             }
@@ -585,49 +609,92 @@ END;
         }
 
         /// <summary>
-        /// One full retrieval pass: runs the three channels concurrently and max-fuses
-        /// them. <paramref name="fuzzy"/> controls whether the lexical channel uses
+        /// One full retrieval pass: runs the channels concurrently and fuses them by rank
+        /// (reciprocal rank fusion), not by raw score, so the cosine and BM25 scales never have
+        /// to agree. <paramref name="fuzzy"/> controls whether the lexical channel uses
         /// token-level fuzzy matching (and trigram recall, if configured).
+        /// <para>
+        /// <paramref name="minimumSimilarity"/> stays a cosine floor: the vector channel applies it,
+        /// and every result's <c>Similarity</c> is its cosine against the query, so a keyword-only
+        /// hit must clear the same floor to be returned.
+        /// </para>
         /// </summary>
         private async Task<List<FeedbackDatabaseValues>> RunSearchPassAsync(
             string searchText, int topK, float minimumSimilarity, int searchLevel, bool fuzzy)
         {
-            // Run all three retrieval strategies concurrently. The vector channel is
-            // either approximate (LSH) or exact brute-force, per configuration.
+            // One embedding of the query serves the vector channel and the cosine of any hit
+            // that only the keyword channel found.
+            float[] queryEmbedding = await _embedder.GetEmbeddingsAsync(searchText);
+
+            // The vector channel is either approximate (LSH) or exact brute-force, per configuration.
             var ftsTask    = SearchWithFTSAsync(searchText, topK, searchLevel, fuzzy);
-            var lshTask    = _config.UseExactVectorSearch
-                ? SearchWithExactAsync(searchText, topK, minimumSimilarity)
+            var vectorTask = _config.UseExactVectorSearch
+                ? SearchWithExactAsync(queryEmbedding, topK, minimumSimilarity)
                 : SearchWithLSHAsync(searchText, topK, minimumSimilarity);
-            var memoryTask = SearchMemoryBasedAsync(searchText, topK);
-            await Task.WhenAll(ftsTask, lshTask, memoryTask);
-            var ftsResults    = ftsTask.Result;
-            var lshResults    = lshTask.Result;
-            var memoryResults = memoryTask.Result;
+            var memoryTask = _config.UseMemoryChannel
+                ? SearchMemoryBasedAsync(searchText, topK)
+                : Task.FromResult(new List<FeedbackDatabaseValues>());
+            await Task.WhenAll(ftsTask, vectorTask, memoryTask);
 
-            // Combine and deduplicate results
-            var combinedResults = new Dictionary<string, FeedbackDatabaseValues>();
+            var vectorResults = vectorTask.Result;
+            var lists = new List<List<FeedbackDatabaseValues>> { vectorResults, ftsTask.Result };
+            if (_config.UseMemoryChannel) lists.Add(memoryTask.Result);
 
-            foreach (var result in ftsResults.Concat(lshResults).Concat(memoryResults))
+            var fused = ReciprocalRankFuse(lists);
+
+            // The vector channel already set Similarity to the cosine; give every other hit its
+            // cosine too so the field means the same thing on every result.
+            var fromVector = vectorResults.Select(r => r.RequestID).ToHashSet();
+            foreach (var doc in fused.Where(d => !fromVector.Contains(d.RequestID)))
+                doc.Similarity = CosineForDoc(doc, queryEmbedding);
+
+            return fused
+                .Where(x => x.Similarity >= minimumSimilarity)
+                .Take(topK)
+                .ToList();
+        }
+
+        /// <summary>
+        /// Reciprocal rank fusion: each list scores a document 1/(60 + rank) and the scores add.
+        /// Documents are matched by RequestID; the first list's copy of a document is kept.
+        /// Returns best-first.
+        /// </summary>
+        private static List<FeedbackDatabaseValues> ReciprocalRankFuse(List<List<FeedbackDatabaseValues>> lists)
+        {
+            const int k = 60;
+            var score = new Dictionary<string, double>();
+            var doc = new Dictionary<string, FeedbackDatabaseValues>();
+
+            foreach (var list in lists)
             {
-                if (result.RequestID == null) continue;
-
-                if (!combinedResults.ContainsKey(result.RequestID))
+                int rank = 0;
+                foreach (var item in list)
                 {
-                    combinedResults[result.RequestID] = result;
-                }
-                else
-                {
-                    // Keep the higher similarity score
-                    combinedResults[result.RequestID].Similarity =
-                        Math.Max(combinedResults[result.RequestID].Similarity ?? 0, result.Similarity ?? 0);
+                    if (item.RequestID == null) continue;
+                    rank++;
+                    score[item.RequestID] = score.GetValueOrDefault(item.RequestID) + 1.0 / (k + rank);
+                    doc.TryAdd(item.RequestID, item);
                 }
             }
 
-            return combinedResults.Values
-                .Where(x => x.Similarity >= minimumSimilarity)
-                .OrderByDescending(x => x.Similarity)
-                .Take(topK)
-                .ToList();
+            return score.OrderByDescending(kv => kv.Value).Select(kv => doc[kv.Key]).ToList();
+        }
+
+        /// <summary>Cosine of a document against the query: its best vector (whole document or chunk).</summary>
+        private double CosineForDoc(FeedbackDatabaseValues doc, float[] queryEmbedding)
+        {
+            double best = double.NegativeInfinity;
+
+            if (_exactVectors.TryGetValue(doc.Id, out var whole))
+                best = CalculateCosineSimilarity(queryEmbedding, whole);
+            if (_exactChunkVectors.TryGetValue(doc.Id, out var chunks))
+                foreach (var chunk in chunks)
+                    best = Math.Max(best, CalculateCosineSimilarity(queryEmbedding, chunk));
+
+            if (double.IsNegativeInfinity(best) && doc.RequestEmbedding != null)
+                best = CalculateCosineSimilarity(queryEmbedding, doc.RequestEmbedding);
+
+            return double.IsNegativeInfinity(best) ? 0.0 : best;
         }
 
         public async Task<List<FeedbackDatabaseValues>> SearchMemoryBasedAsync(string searchText, int topK)
@@ -1720,6 +1787,11 @@ WHERE RequestID = @RequestID";
 
         private async Task<List<FeedbackDatabaseValues>> SearchWithFTSAsync(string searchText, int topK, int searchLevel, bool fuzzy)
         {
+            // Exact mode ranks by the index's own BM25 (term rarity, saturation, length). The
+            // fuzzy path below needs the token-level scorer for typo tolerance, so it keeps it.
+            if (!fuzzy)
+                return await SearchWithBm25Async(searchText, topK, searchLevel);
+
             var results = new List<FeedbackDatabaseValues>();
             var searchWords = PrepareSearchWords(searchText);
 
@@ -1813,6 +1885,59 @@ WHERE e.Id IN (
             return results.OrderByDescending(x => x.Similarity).Take(topK).ToList();
         }
 
+        /// <summary>
+        /// Keyword channel, exact mode: FTS5 BM25 order over the stemmed index. Terms are whole
+        /// alphanumeric tokens (the way the index tokenizes), so punctuation such as hyphens,
+        /// brackets, slashes or quotes can neither break the MATCH syntax nor glue words into
+        /// phrases. Results come back best-first; <c>Similarity</c> is left for the fusion step,
+        /// which sets it to the cosine against the query.
+        /// </summary>
+        private async Task<List<FeedbackDatabaseValues>> SearchWithBm25Async(string searchText, int topK, int searchLevel)
+        {
+            var results = new List<FeedbackDatabaseValues>();
+
+            var terms = System.Text.RegularExpressions.Regex
+                .Matches(searchText.ToLowerInvariant(), @"[\p{L}\p{N}]+")
+                .Select(m => m.Value)
+                .Where(w => w.Length > 1 && !StopWords.Contains(w))
+                .Distinct()
+                .ToArray();
+            if (terms.Length == 0)
+                return results;
+
+            // A wider pool than topK so rows rejected by the search-level check below don't
+            // leave the list short.
+            const string query = @"
+SELECT e.* FROM embeddings e
+JOIN (SELECT rowid AS rid, rank FROM embeddings_fts WHERE embeddings_fts MATCH @SearchText ORDER BY rank LIMIT @Pool) f
+  ON e.Id = f.rid
+ORDER BY f.rank";
+
+            using var connection = await GetConnectionAsync();
+            using var command = new SqliteCommand(query, connection);
+            command.Parameters.AddWithValue("@SearchText", string.Join(" OR ", terms.Select(t => $"\"{t}\"")));
+            command.Parameters.AddWithValue("@Pool", topK * 5);
+
+            using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync() && results.Count < topK)
+            {
+                var row = ReadFeedbackFromReader(reader);
+
+                bool request = !string.IsNullOrEmpty(row.Request);
+                bool response = !string.IsNullOrEmpty(row.TextResponse);
+                bool tool = !string.IsNullOrEmpty(row.ToolUseTextResponse);
+
+                if ((searchLevel == 1 && request) ||
+                    (searchLevel == 2 && request && response) ||
+                    (searchLevel == 3 && request && response && tool))
+                {
+                    results.Add(row);
+                }
+            }
+
+            return results;
+        }
+
         private async Task<List<FeedbackDatabaseValues>> SearchWithLSHAsync(string searchText, int topK, float minimumSimilarity)
         {
             var results = new List<FeedbackDatabaseValues>();
@@ -1844,10 +1969,12 @@ WHERE e.Id IN (
         /// top-K rows are loaded from the database.
         /// </summary>
         private async Task<List<FeedbackDatabaseValues>> SearchWithExactAsync(string searchText, int topK, float minimumSimilarity)
+            => await SearchWithExactAsync(await _embedder.GetEmbeddingsAsync(searchText), topK, minimumSimilarity);
+
+        private async Task<List<FeedbackDatabaseValues>> SearchWithExactAsync(float[]? searchEmbedding, int topK, float minimumSimilarity)
         {
             var results = new List<FeedbackDatabaseValues>();
 
-            float[]? searchEmbedding = await _embedder.GetEmbeddingsAsync(searchText);
             if (searchEmbedding == null || searchEmbedding.Length == 0 || _exactVectors.IsEmpty)
                 return results;
 

@@ -38,6 +38,10 @@ Each elected chunk is tagged with an 8-hex embedding hash (`[RAG:a3f9b2c1]`) for
 
 **Election log.** Every run stores an `ElectionTrace` under `MetaData["RagElectionLog"]` on the request's row, and returns it as `EERagResult.Election`: every proposed entry in full (capped at 8,000 characters, flagged if cut) beside the summary the model saw, the model's raw replies, the ids chosen or refused, what was injected, and what DCS did (query thread, boosted ids). It is written so a human or an AI reviewer can judge the choice from the whole retrieval. DCS only reorders the search's own candidates; it never adds an entry or any text of its own.
 
+**Hybrid search.** Each query runs two channels and fuses them by rank (reciprocal rank fusion, so cosine and BM25 scales never have to agree): exact cosine search over every stored vector, and BM25 over a stemmed (porter) full-text index. `minimumSimilarity` is a cosine floor: every result's `Similarity` is its cosine against the query, and a keyword-only hit must clear the same floor. Fuzzy mode keeps its token-level scorer for typo tolerance. A third hash-bucket "memory" channel exists but is off by default (`UseMemoryChannel`): on 5,000 documents it returned about one result per query. Older databases get their full-text index rebuilt with stemming the first time they are opened.
+
+On BEIR SciFact (300 queries, MiniLM-L12 int8, chunks off) this took nDCG@10 from 0.646 to 0.723, Recall@5 from 0.714 to 0.808, Recall@10 from 0.798 to 0.869 and Recall@100 from 0.932 to 0.953. The keyword channel on its own went from 0.505 to 0.681 nDCG@10 (published BM25 is about 0.665).
+
 ### DCS: Structured Context Routing
 
 Instead of embedding similarity alone, DCS routes context through a three-level identifier hierarchy:
