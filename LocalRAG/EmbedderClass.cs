@@ -34,6 +34,16 @@ namespace LocalRAG
                 IntraOpNumThreads = _config.IntraOpNumThreads
             };
 
+            // Optional GPU via DirectML (any DirectX 12 GPU, including AMD). Needs the
+            // DirectML build of ONNX Runtime (build with -p:UseDirectML=true) and a model that
+            // runs on it (an fp32/fp16 export, not the int8 CPU model).
+            if (_config.GpuDeviceId is int gpu)
+            {
+                sessionOptions.EnableMemoryPattern = false;                 // DirectML requirements
+                sessionOptions.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
+                sessionOptions.AppendExecutionProvider_DML(gpu);
+            }
+
             _session = new InferenceSession(_config.ModelPath, sessionOptions);
 
             // Determine hidden dimension from model metadata
@@ -123,20 +133,25 @@ namespace LocalRAG
             if (string.IsNullOrWhiteSpace(text))
                 throw new ArgumentException("Text is empty after preprocessing.", nameof(textToEmbed));
 
-            var (inputIds, attentionMask, tokenTypeIds) = _tokenizer.Encode(text, _config.MaxSequenceLength, _config.MaxSequenceLength);
+            // Encode to the text's real length, then pad only to PaddedLength (not always 512).
+            var (ids0, mask0, types0) = _tokenizer.Encode(text, _config.MaxSequenceLength);
+            int len = PaddedLength(ids0.Length);
+            var inputIds = PadTo(ids0.Span, len);
+            var attentionMask = PadTo(mask0.Span, len);
+            var tokenTypeIds = PadTo(types0.Span, len);
 
             var inputData = new List<NamedOnnxValue>
             {
                 NamedOnnxValue.CreateFromTensor("input_ids",
-                    new DenseTensor<long>(inputIds, new[] { 1, _config.MaxSequenceLength })),
+                    new DenseTensor<long>(inputIds, new[] { 1, len })),
                 NamedOnnxValue.CreateFromTensor("attention_mask",
-                    new DenseTensor<long>(attentionMask, new[] { 1, _config.MaxSequenceLength }))
+                    new DenseTensor<long>(attentionMask, new[] { 1, len }))
             };
 
             if (_session.InputMetadata.ContainsKey("token_type_ids"))
             {
                 inputData.Add(NamedOnnxValue.CreateFromTensor("token_type_ids",
-                    new DenseTensor<long>(tokenTypeIds, new[] { 1, _config.MaxSequenceLength })));
+                    new DenseTensor<long>(tokenTypeIds, new[] { 1, len })));
             }
 
             using var results = await Task.Run(() => _session.Run(inputData));
@@ -172,6 +187,24 @@ namespace LocalRAG
         /// representation the model was actually optimized to produce. Padding tokens
         /// (attention_mask == 0) are excluded from the average.
         /// </summary>
+        /// <summary>
+        /// Length a text is padded to for inference. Attention-masked padding changes nothing
+        /// in the pooled vector but costs compute, and most texts are far shorter than 512
+        /// tokens, so by default pad only to the next multiple of 16 (few distinct shapes keeps
+        /// a GPU fast). <see cref="RAGConfiguration.PadToMaxSequenceLength"/> restores 512.
+        /// </summary>
+        private int PaddedLength(int tokens) =>
+            _config.PadToMaxSequenceLength
+                ? _config.MaxSequenceLength
+                : Math.Min(_config.MaxSequenceLength, Math.Max(16, (tokens + 15) / 16 * 16));
+
+        private static long[] PadTo(ReadOnlySpan<long> src, int len)
+        {
+            var padded = new long[len];
+            src[..Math.Min(src.Length, len)].CopyTo(padded);
+            return padded;
+        }
+
         private float[] ExtractMeanEmbedding(Tensor<float> tensor, Memory<long> attentionMask)
         {
             var dims = tensor.Dimensions.ToArray();
@@ -264,8 +297,6 @@ namespace LocalRAG
         /// </summary>
         private async Task<List<float[]>> GetEmbeddingsBatchInternalAsync(IReadOnlyList<string> rawTexts)
         {
-            int seq = _config.MaxSequenceLength;
-
             // Preprocess and drop chunks that are empty after normalization, keeping the
             // raw chunk text (for the memory-index tag) aligned with the processed text.
             var raw = new List<string>(rawTexts.Count);
@@ -283,17 +314,23 @@ namespace LocalRAG
             if (n == 0) return new List<float[]>();
 
             bool hasTypeIds = _session.InputMetadata.ContainsKey("token_type_ids");
+
+            // Encode each text to its real length; the batch is padded to its longest member.
+            var encoded = processed
+                .Select(p => _tokenizer.Encode(p, _config.MaxSequenceLength))
+                .ToList();
+            int seq = PaddedLength(encoded.Max(e => e.InputIds.Length));
+
             var ids   = new long[n * seq];
             var mask  = new long[n * seq];
             var types = hasTypeIds ? new long[n * seq] : null;
 
             for (int r = 0; r < n; r++)
             {
-                var (inputIds, attentionMask, tokenTypeIds) =
-                    _tokenizer.Encode(processed[r], seq, seq);
-                inputIds.Span.CopyTo(ids.AsSpan(r * seq, seq));
-                attentionMask.Span.CopyTo(mask.AsSpan(r * seq, seq));
-                if (hasTypeIds) tokenTypeIds.Span.CopyTo(types!.AsSpan(r * seq, seq));
+                var (inputIds, attentionMask, tokenTypeIds) = encoded[r];
+                inputIds.Span.CopyTo(ids.AsSpan(r * seq, inputIds.Length));
+                attentionMask.Span.CopyTo(mask.AsSpan(r * seq, attentionMask.Length));
+                if (hasTypeIds) tokenTypeIds.Span.CopyTo(types!.AsSpan(r * seq, tokenTypeIds.Length));
             }
 
             var inputData = new List<NamedOnnxValue>

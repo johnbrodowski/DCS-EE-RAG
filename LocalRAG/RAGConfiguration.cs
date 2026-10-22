@@ -93,6 +93,20 @@ namespace LocalRAG
         public int IntraOpNumThreads { get; set; } = 0;
 
         /// <summary>
+        /// DirectML GPU device index to run the embedding model on, or null for the CPU
+        /// (default). Requires the DirectML build of ONNX Runtime (<c>-p:UseDirectML=true</c>).
+        /// </summary>
+        public int? GpuDeviceId { get; set; } = null;
+
+        /// <summary>
+        /// When true, every text is padded to <see cref="MaxSequenceLength"/> before inference
+        /// (the old behaviour). Default false: pad only to the text's own length, rounded up to a
+        /// multiple of 16. The padding is attention-masked, so vectors are the same either way;
+        /// short texts just stop paying for 512 tokens.
+        /// </summary>
+        public bool PadToMaxSequenceLength { get; set; } = false;
+
+        /// <summary>
         /// When true, stop words are removed from text before embedding.
         /// BERT is trained on complete sentences so this is off by default.
         /// </summary>
