@@ -123,6 +123,16 @@ namespace LocalRAG
         public bool IndexChunkEmbeddings { get; set; } = true;
 
         /// <summary>
+        /// Folder for a shared on-disk cache of single-text embeddings, keyed by a hash of the
+        /// preprocessed text plus the model and the settings that change the vector. Null (the
+        /// default) turns it off. Several processes may share one folder. A hit returns the stored
+        /// vector instead of running the model, which pays off when the same texts are embedded
+        /// again (for example benchmarks whose questions share filler sessions). Not used for the
+        /// chunk lists, and ignored while <see cref="UseMemoryChannel"/> is on.
+        /// </summary>
+        public string? EmbeddingCacheDirectory { get; set; } = null;
+
+        /// <summary>
         /// When true (default), the vector retrieval channel does an exact brute-force
         /// cosine scan over every embedding instead of LSH approximate candidate
         /// generation. More accurate (no bucketing loss) and, at local single-user corpus

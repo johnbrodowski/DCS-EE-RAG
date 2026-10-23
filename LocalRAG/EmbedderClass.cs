@@ -14,6 +14,8 @@ namespace LocalRAG
         private readonly MemoryHashIndex _memoryIndex;
         private readonly RAGConfiguration _config;
         private readonly int _hiddenDim;
+        private readonly string? _cacheDir;      // null = cache off
+        private readonly string _cacheSalt = "";
         private bool _disposed;
 
         private static readonly HashSet<string> StopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -63,6 +65,16 @@ namespace LocalRAG
                 NumBuckets = 256
             };
             _memoryIndex = new MemoryHashIndex(hashOptions);
+
+            // Optional shared embedding cache (see RAGConfiguration.EmbeddingCacheDirectory). The salt makes
+            // vectors from another model or other vector-changing settings land under different keys.
+            if (!string.IsNullOrWhiteSpace(_config.EmbeddingCacheDirectory) && !_config.UseMemoryChannel)
+            {
+                _cacheDir = _config.EmbeddingCacheDirectory;
+                Directory.CreateDirectory(_cacheDir);
+                var model = new FileInfo(_config.ModelPath);
+                _cacheSalt = $"v1|{model.Name}|{model.Length}|{_config.MaxSequenceLength}|{_config.RemoveStopWords}|{_config.LowercaseInput}";
+            }
         }
 
         private int GetHiddenDimensionFromModel()
@@ -119,6 +131,56 @@ namespace LocalRAG
         }
 
         private async Task<float[]> GetEmbeddingsInternalAsync(string textToEmbed)
+        {
+            if (_cacheDir == null) return await ComputeEmbeddingAsync(textToEmbed);
+
+            var key = CacheKey(textToEmbed);
+            if (key == null) return await ComputeEmbeddingAsync(textToEmbed);   // empty text: fails exactly as before
+            var path = Path.Combine(_cacheDir, key[..2], key + ".bin");
+            var hit = ReadCachedVector(path);
+            if (hit != null) return hit;
+            var vector = await ComputeEmbeddingAsync(textToEmbed);
+            WriteCachedVector(path, vector);
+            return vector;
+        }
+
+        private string? CacheKey(string textToEmbed)
+        {
+            var t = _config.RemoveStopWords ? RemoveStopWords(textToEmbed) : textToEmbed;
+            t = NormalizeWhitespace(t);
+            if (string.IsNullOrWhiteSpace(t)) return null;
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(_cacheSalt + "\n" + t))).ToLowerInvariant();
+        }
+
+        private static float[]? ReadCachedVector(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return null;
+                var bytes = File.ReadAllBytes(path);
+                if (bytes.Length == 0 || bytes.Length % 4 != 0) return null;
+                var v = new float[bytes.Length / 4];
+                Buffer.BlockCopy(bytes, 0, v, 0, bytes.Length);
+                return v;
+            }
+            catch { return null; }   // an unreadable entry is just a miss
+        }
+
+        private static void WriteCachedVector(string path, float[] vector)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";   // write whole, then move: readers never see half a file
+                var bytes = new byte[vector.Length * 4];
+                Buffer.BlockCopy(vector, 0, bytes, 0, bytes.Length);
+                File.WriteAllBytes(tmp, bytes);
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch { /* a failed write only loses the speed-up */ }
+        }
+
+        private async Task<float[]> ComputeEmbeddingAsync(string textToEmbed)
         {
             var text = textToEmbed;
 
