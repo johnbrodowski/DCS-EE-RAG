@@ -36,7 +36,7 @@ Each elected chunk is tagged with an 8-hex embedding hash (`[RAG:a3f9b2c1]`) for
 
 **More candidates, once.** If none of the first `topK` summaries look relevant the model may reply with the bare word `MORE`. The system then repeats the same search one set deeper and shows the next `topK` entries. The model cannot choose the number or change any setting (`MORE 50` is not a request), it can ask only once, and the next turn is back to normal.
 
-**Election log.** Every run stores an `ElectionTrace` under `MetaData["RagElectionLog"]` on the request's row, and returns it as `EERagResult.Election`: every proposed entry in full (capped at 8,000 characters, flagged if cut) beside the summary the model saw, the model's raw replies, the ids chosen or refused, what was injected, and what DCS did (query thread, boosted ids). It is written so a human or an AI reviewer can judge the choice from the whole retrieval. DCS only reorders the search's own candidates; it never adds an entry or any text of its own.
+**Election log.** Every search and retrieve stores an `ElectionTrace` under `MetaData["RagElectionLog"]` on the request's row,: every proposed entry in full (capped at 8,000 characters, flagged if cut) beside the summary that was shown, the caller's raw reply, the ids chosen or refused, what was injected, and what DCS did (query thread, boosted ids). It is written so a human or an AI reviewer can judge the choice from the whole retrieval. DCS only reorders the search's own candidates; it never adds an entry or any text of its own.
 
 **Hybrid search.** Each query runs two channels and fuses them by rank (reciprocal rank fusion, so cosine and BM25 scales never have to agree): exact cosine search over every stored vector, and BM25 over a stemmed (porter) full-text index. `minimumSimilarity` is a cosine floor: every result's `Similarity` is its cosine against the query, and a keyword-only hit must clear the same floor. Fuzzy mode keeps its token-level scorer for typo tolerance. A third hash-bucket "memory" channel exists but is off by default (`UseMemoryChannel`): on 5,000 documents it returned about one result per query. Older databases get their full-text index rebuilt with stemming the first time they are opened.
 
@@ -181,30 +181,47 @@ dotnet test LocalRAG.Tests/
 
 ## Usage
 
-### EE-RAG Without DCS
+No AI provider is built in. The calling AI (any model, any language) is the "model" in EE-RAG: it sends one JSON request and gets one JSON reply back. `EERagPipeline.HandleAsync(json, db, dcs?)` is the entry point; a failure comes back as `{"error":"..."}`.
 
 ```csharp
-var config  = new RAGConfiguration();
-var db      = new EmbeddingDatabaseNew(config);
-var session = /* create an IChatSession */;
+var db  = new EmbeddingDatabaseNew(new RAGConfiguration());
+var dcs = new DcsContextAssembler();   // optional; pass null for EE-RAG without DCS
 
-var result = await EERagPipeline.RunPipelineAsync(
-    userMessage : "How do I fix the authentication bug?",
-    requestId   : Guid.NewGuid().ToString(),
-    session     : session,
-    db          : db,
-    topK        : 5,
-    silentMode  : false
-);
+// 1. Store an entry (a row the audit can be written to; embed:true makes it searchable)
+await EERagPipeline.HandleAsync("""
+  {"op":"store","requestId":"turn-42","request":"How do I fix the authentication bug?","embed":false}
+  """, db);
 
-Console.WriteLine(result.FinalResponse);
+// 2. Search: summaries only (Layer 1)
+var search = await EERagPipeline.HandleAsync("""
+  {"op":"search","requestId":"turn-42","query":"How do I fix the authentication bug?","topK":5}
+  """, db, dcs);
+// {"requestId":"turn-42",
+//  "candidates":[{"id":12,"requestId":"...","similarity":0.87,"summary":"Auth flow uses JWT...","dcsBoosted":true,"batch":1}, ...],
+//  "header":"--- Potentially Relevant Context --- ...",   <- text to put in front of the AI
+//  "moreAvailable":true, "dcsQueryDcnId":3}
+
+// 3. The AI elects ids from the summaries (Layer 2), by id or by its raw reply
+var got = await EERagPipeline.HandleAsync("""
+  {"op":"retrieve","requestId":"turn-42","ids":[12]}
+  """, db);                                                // or "reply":"RETRIEVE 12"
+// {"electedIds":[12],"rejectedIds":[],"hashes":["a3f9b2c1"],
+//  "chunks":[{"id":12,"hash":"a3f9b2c1","request":"...","response":"...","toolResponse":null}],
+//  "context":"--- Retrieved Context ... ---",             <- use for this turn only (Layer 3)
+//  "tags":" [RAG:a3f9b2c1]"}
 ```
 
-### EE-RAG With DCS Pre-Filtering
+| Request | Fields |
+|---------|--------|
+| `store` | `requestId`, `request`, optional `response`, `embed` (default `true`) |
+| `search` | `requestId` (must be stored), `query`, `topK` (default 5), `more` (the next `topK` entries, once per request) |
+| `retrieve` | `requestId`, and `ids` or `reply` (a raw `RETRIEVE 3 7` reply); optional `silent` (Layer 5: condensed context) |
+
+Only ids that the `search` for that `requestId` surfaced are served; anything else comes back in `rejectedIds`. The audit and election log are written to the row's `MetaData` as before.
+
+### DCS
 
 ```csharp
-var dcs = new DcsContextAssembler();
-
 // Register prior messages to build context
 dcs.RegisterMessage(new DcsMessageRecord
 {
@@ -217,17 +234,9 @@ dcs.RegisterMessage(new DcsMessageRecord
 
 // Optionally manage DCNs
 var dcnNode = dcs.FindOrCreateDcn(DcsIntentClassifier.Classify(userMessage));
-
-// Run pipeline with DCS
-var result = await EERagPipeline.RunPipelineAsync(
-    userMessage  : userMessage,
-    requestId    : requestId,
-    session      : session,
-    db           : db,
-    topK         : 5,
-    dcsAssembler : dcs      // Enables DCS pre-filtering and candidate boosting
-);
 ```
+
+Passing `dcs` to `HandleAsync` makes `search` re-rank its own candidates (`"dcsBoosted": true`); DCS never adds an entry or any text of its own.
 
 ### Inspecting DCS Decisions
 
@@ -306,26 +315,13 @@ DCN influence decays exponentially: `weight = exp(-age_hours / 24)`
 All DCS and pipeline steps emit structured `Debug.WriteLine` output (filtered from Release builds) using the `[DCS]` prefix. View in the Visual Studio Output window or any debug listener.
 
 ```
-[DCS 14:23:01.334] Pipeline > === EE-RAG Pipeline Start ===
-[DCS 14:23:01.335] Pipeline > User message: "How do I fix the auth bug?" (42 chars)
+[DCS 14:23:01.334] Pipeline > search "How do I fix the auth bug?" requestId=turn-42 topK=5 more=False dcs=on
 [DCS 14:23:01.336] Classify > Intents: [QUERY(1), FIX(8)] from "How do I fix the auth bug?"
 [DCS 14:23:01.337] Classify > Domains: [BACKEND(1)] from "How do I fix the auth bug?"
 [DCS 14:23:01.338] Assemble > Step 1: Index lookup found 8 candidates from 3 identifiers (45 total messages)
 [DCS 14:23:01.340] Assemble >   msg-003: similarity=0.847 x decay=0.990 -> score=0.838
 [DCS 14:23:01.341] Assemble >   msg-007: similarity=0.210 < threshold 0.100, skipped
-[DCS 14:23:01.342] Assemble > Result: 6 messages selected (max 50)
-[DCS 14:23:01.350] Pipeline > Step 1: Found 5 candidates: [ID:12 sim=0.873, ID:7 sim=0.720, ...]
-[DCS 14:23:01.351] Pipeline > ---- CANDIDATE HEADER SENT TO MODEL ----
-[DCS 14:23:01.351] Pipeline > [ID:12] Auth flow uses JWT tokens with 1-hour expiry...
-[DCS 14:23:01.352] Pipeline > ---- END CANDIDATE HEADER ----
-[DCS 14:23:01.890] Pipeline > ---- MODEL FIRST RESPONSE ----
-[DCS 14:23:01.890] Pipeline > RETRIEVE 12
-[DCS 14:23:01.890] Pipeline > ---- END MODEL FIRST RESPONSE ----
-[DCS 14:23:02.100] Pipeline > ---- MODEL FINAL RESPONSE ----
-[DCS 14:23:02.100] Pipeline > To fix the authentication bug, update the token refresh logic...
-[DCS 14:23:02.101] Pipeline > ---- END MODEL FINAL RESPONSE ----
-[DCS 14:23:02.102] Pipeline > === EE-RAG Pipeline Complete ===
-[DCS 14:23:02.102] Pipeline > Candidates surfaced: 5, Elected: 1, Retrieval: yes
+[DCS 14:23:01.890] Pipeline > retrieve requestId=turn-42 elected=[12] rejected=[] outcome=elected
 ```
 
 **Section labels for filtering:**
@@ -347,7 +343,7 @@ All DCS and pipeline steps emit structured `Debug.WriteLine` output (filtered fr
 
 **Invisible infrastructure** — Retrieved content never appears in the model's conversation history. Future turns see clean dialogue.
 
-**Elective retrieval** — The model decides what to retrieve based on summaries, not the retrieval system. If nothing is relevant, no second inference call is made.
+**Elective retrieval** — The calling AI decides what to retrieve based on summaries, not the retrieval system. If nothing is relevant it simply never sends a `retrieve` request.
 
 **Deterministic routing** — Context selection via structured identifiers is reproducible and debuggable. Threshold decisions can be traced in logs.
 

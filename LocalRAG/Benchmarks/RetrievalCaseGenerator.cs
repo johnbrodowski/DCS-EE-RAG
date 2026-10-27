@@ -1,4 +1,3 @@
-using AiMessagingCore.Abstractions;
 using Newtonsoft.Json;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -87,7 +86,7 @@ namespace LocalRAG.Benchmarks
         /// </summary>
         public static async Task<BenchmarkDataset> GenerateWithLlmAsync(
             BenchmarkDataset source,
-            Func<IChatSession> sessionFactory,
+            Func<string, Task<string>> askModel,
             int paraphrasesPerEntry = 3,
             IProgress<string>? progress = null,
             CancellationToken ct = default)
@@ -113,9 +112,9 @@ namespace LocalRAG.Benchmarks
                 string content;
                 try
                 {
-                    var session = sessionFactory();
-                    var reply = await session.SendAsync(prompt, cancellationToken: ct);
-                    content = reply.Content ?? "";
+                    // askModel is the calling AI: a prompt in, the reply text out.
+                    var reply = await askModel(prompt);
+                    content = reply ?? "";
                 }
                 catch (Exception ex)
                 {

@@ -18,7 +18,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\LocalRAG\LocalRAG.csproj" />
-    <ProjectReference Include="..\AIClients\AiMessagingCore\AiMessagingCore.csproj" />
   </ItemGroup>
 
   <ItemGroup>

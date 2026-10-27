@@ -1,4 +1,3 @@
-using AiMessagingCore.Abstractions;
 using Newtonsoft.Json;
 using System.Diagnostics;
 using System.Reflection;
@@ -78,10 +77,68 @@ namespace LocalRAG.Benchmarks
 
         // ── Benchmark runner ──────────────────────────────────────────────────
 
+        private sealed class CaseOutcome
+        {
+            public string FinalResponse { get; init; } = string.Empty;
+            public string FirstResponse { get; init; } = string.Empty;
+            public List<int> CandidateIdsSurfaced { get; init; } = [];
+            public List<int> ElectedIds { get; init; } = [];
+            public bool RetrievalOccurred => ElectedIds.Count > 0;
+        }
+
+        /// <summary>
+        /// One EE-RAG turn over the JSON interface: store the query row, search, ask the model
+        /// (<paramref name="askModel"/> takes a prompt and returns the reply), and if it elected
+        /// entries, retrieve them and ask once more with the retrieved text.
+        /// </summary>
+        private static async Task<CaseOutcome> RunCaseAsync(
+            string query, string requestId, Func<string, Task<string>> askModel,
+            EmbeddingDatabaseNew db, int topK, bool silent)
+        {
+            await db.AddRequestToEmbeddingDatabaseAsync(requestId, query, embed: false);
+
+            async Task<Newtonsoft.Json.Linq.JObject> Call(object request) =>
+                Newtonsoft.Json.Linq.JObject.Parse(
+                    await EERagPipeline.HandleAsync(JsonConvert.SerializeObject(request), db));
+
+            var search = await Call(new { op = "search", requestId, query, topK });
+            var surfaced = search["candidates"]!.Select(c => (int)c["id"]!).ToList();
+            var reply = await askModel($"{query}\n\n{(string)search["header"]!}");
+
+            if (EERagPipeline.IsMoreRequest(reply))
+            {
+                search = await Call(new { op = "search", requestId, query, topK, more = true });
+                surfaced = search["candidates"]!.Select(c => (int)c["id"]!).ToList();
+                reply = await askModel($"{query}\n\n{(string)search["header"]!}");
+            }
+
+            var first = reply;
+            bool refusedMore = EERagPipeline.IsMoreRequest(reply); // a second MORE is refused
+            var ids = refusedMore ? [] : EERagPipeline.ParseRetrieveIds(reply);
+
+            var retrieve = await Call(new { op = "retrieve", requestId, ids, silent });
+            var elected = retrieve["electedIds"]!.Select(t => (int)t).ToList();
+
+            string final = first;
+            if (elected.Count > 0)
+                final = await askModel($"{query}\n\n{(string)retrieve["context"]!}") + (string)retrieve["tags"]!;
+            else if (ids.Count > 0 || refusedMore)
+                final = await askModel(
+                    $"{query}\n\nNo additional context is available for this request. Answer directly; do not ask to retrieve anything.");
+
+            return new CaseOutcome
+            {
+                FinalResponse = final,
+                FirstResponse = first,
+                CandidateIdsSurfaced = surfaced,
+                ElectedIds = elected
+            };
+        }
+
         public static async Task<BenchmarkReport> RunAsync(
             BenchmarkDataset dataset,
             Dictionary<string, int> slugToId,
-            Func<IChatSession> sessionFactory,
+            Func<string, Task<string>> askModel,
             EmbeddingDatabaseNew db,
             BenchmarkOptions? options = null,
             IProgress<string>? progress = null,
@@ -100,21 +157,13 @@ namespace LocalRAG.Benchmarks
                 progress?.Report(
                     $"[{i + 1}/{dataset.Cases.Count}] Case {benchCase.Id}: {benchCase.Query}");
 
-                // Fresh session per case — prevents conversation history from one case
-                // bleeding into the next and biasing the model's retrieval decisions.
-                var session = sessionFactory();
-
                 var caseSw = Stopwatch.StartNew();
                 var requestId = $"bench-run:{benchCase.Id}:{Guid.NewGuid():N}";
 
-                var result = await EERagPipeline.RunPipelineAsync(
-                    benchCase.Query,
-                    requestId,
-                    session,
-                    db,
-                    topK: options.TopK,
-                    silentMode: options.SilentMode,
-                    cancellationToken: ct);
+                // askModel is the calling AI. Each case is independent: askModel must not carry
+                // conversation history from one case into the next.
+                var result = await RunCaseAsync(
+                    benchCase.Query, requestId, askModel, db, options.TopK, options.SilentMode);
 
                 caseSw.Stop();
 

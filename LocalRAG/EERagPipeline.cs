@@ -3,43 +3,11 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
-using AiMessagingCore.Abstractions;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace LocalRAG
 {
-    /// <summary>
-    /// Result returned by <see cref="EERagPipeline.RunPipelineAsync"/>.
-    /// </summary>
-    public sealed class EERagResult
-    {
-        /// <summary>The final assistant response text (including any [RAG:hash] tags).</summary>
-        public string FinalResponse { get; init; } = string.Empty;
-
-        /// <summary>The candidate summary block that was sent as transient context in Phase 1.</summary>
-        public string CandidateHeader { get; init; } = string.Empty;
-
-        /// <summary>The raw first response from the model (may contain a RETRIEVE command).</summary>
-        public string FirstResponse { get; init; } = string.Empty;
-
-        /// <summary>IDs of the candidates that were surfaced to the model (Phase 1 audit).</summary>
-        public List<int> CandidateIdsSurfaced { get; init; } = [];
-
-        /// <summary>IDs elected by the model via RETRIEVE command (empty if none requested).</summary>
-        public List<int> ElectedIds { get; init; } = [];
-
-        /// <summary>8-hex hashes of the elected chunks appended to the assistant turn (Phase 2 audit).</summary>
-        public List<string> ElectedHashes { get; init; } = [];
-
-        /// <summary>True if the model elected at least one chunk for full retrieval.</summary>
-        public bool RetrievalOccurred => ElectedIds.Count > 0;
-
-        /// <summary>True if the model asked for (and the system supplied) the next set of candidates.</summary>
-        public bool MoreRequested { get; init; }
-
-        /// <summary>Full record of this election, also persisted to the request's MetaData for review.</summary>
-        public ElectionTrace Election { get; init; } = new();
-    }
-
     /// <summary>One candidate shown to the model, with the full entry a reviewer needs to judge the choice.</summary>
     public sealed class ElectionProposal
     {
@@ -94,339 +62,284 @@ namespace LocalRAG
     }
 
     /// <summary>
-    /// Elective Ephemeral RAG pipeline — implements the five-layer EE-RAG architecture.
+    /// Elective Ephemeral RAG pipeline as a JSON request/response memory. No model is called
+    /// here: the calling AI is the model, and talks to the pipeline in JSON.
     ///
-    /// Layer 1  Summary-first retrieval with candidate header.
-    /// Layer 2  Model-elected context expansion (RETRIEVE command).
-    /// Layer 3  Transient injection with 8-hex embedding hash references.
-    /// Sec 3.4  Two-phase audit (rag_candidates_surfaced / rag_entries_elected).
-    /// Layer 4  Conversation history isolation (RAG content never enters _messages).
-    /// Layer 5  Silent digestion mode (optional — synthesises chunks before injection).
+    /// Layer 1  Summary-first retrieval: op "search" returns ~25-token summaries (and the
+    ///          candidate header text).
+    /// Layer 2  Caller-elected expansion: op "retrieve" with the ids (or the raw "RETRIEVE n"
+    ///          reply) the caller chose; only ids that were surfaced for that request are served.
+    /// Layer 3  Transient injection: the retrieved text is returned to the caller to use for one
+    ///          turn; nothing is written back into any history. Each chunk carries an 8-hex hash.
+    /// Sec 3.4  Two-phase audit (RagCandidatesSurfaced / RagEntriesElected) and the election log.
+    /// Layer 5  Silent digestion (optional "silent": true): chunks are condensed before return.
+    ///
+    /// Requests (all fields camelCase):
+    ///   {"op":"store","requestId":"r1","request":"...","response":"...","embed":true}
+    ///   {"op":"search","requestId":"r1","query":"...","topK":5,"more":false}
+    ///   {"op":"retrieve","requestId":"r1","ids":[3,7]}   or   {"op":"retrieve","requestId":"r1","reply":"RETRIEVE 3 7"}
+    /// Every reply is a JSON object; a failure is {"error":"..."}.
     /// </summary>
     public static class EERagPipeline
     {
         // ── Public entry point ───────────────────────────────────────────────
 
-        /// <summary>
-        /// Runs the full EE-RAG pipeline for a single user turn.
-        /// </summary>
-        /// <param name="userMessage">The user's message for this turn.</param>
-        /// <param name="requestId">
-        ///   The RequestID under which this turn will be stored in the knowledge base.
-        ///   Used to write the two-phase audit metadata.
-        /// </param>
-        /// <param name="session">A live <see cref="IChatSession"/> that carries persistent conversation history.</param>
-        /// <param name="db">The embedding database used for retrieval and audit writes.</param>
-        /// <param name="topK">Number of candidate entries to retrieve.</param>
-        /// <param name="silentMode">
-        ///   When true (Layer 5), elected chunks are distilled into a compact synthesis before
-        ///   injection so that no raw chunk text ever enters the inference context.
-        /// </param>
+        /// <summary>Handles one JSON request and returns the JSON reply.</summary>
+        /// <param name="requestJson">The request object (see the class summary).</param>
+        /// <param name="db">The embedding database used for storage, retrieval and audit writes.</param>
         /// <param name="dcsAssembler">
-        ///   Optional DCS context assembler. When provided, candidates are pre-filtered
-        ///   using structured identifier routing before building the candidate header.
-        ///   The existing pipeline flow (5 layers) is unchanged.
+        ///   Optional DCS context assembler. When provided, search candidates are re-ranked
+        ///   using structured identifier routing. It only reorders; it never adds an entry.
         /// </param>
-        /// <param name="cancellationToken">Cancellation token.</param>
-        public static async Task<EERagResult> RunPipelineAsync(
-            string userMessage,
-            string requestId,
-            IChatSession session,
+        public static async Task<string> HandleAsync(
+            string requestJson,
             EmbeddingDatabaseNew db,
-            int topK = 5,
-            bool silentMode = false,
-            DcsContextAssembler? dcsAssembler = null,
-            CancellationToken cancellationToken = default)
+            DcsContextAssembler? dcsAssembler = null)
         {
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > === EE-RAG Pipeline Start ===");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > User message: \"{Truncate(userMessage, 120)}\" ({userMessage.Length} chars)");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > RequestID: {requestId}, topK={topK}, silentMode={silentMode}, dcsAssembler={( dcsAssembler != null ? "provided" : "null")}");
+            try
+            {
+                var req = JObject.Parse(requestJson);
+                var op = ((string?)req["op"])?.Trim().ToLowerInvariant();
+                JObject reply = op switch
+                {
+                    "store"    => await StoreAsync(req, db),
+                    "search"   => await SearchAsync(req, db, dcsAssembler),
+                    "retrieve" => await RetrieveAsync(req, db),
+                    _ => throw new ArgumentException("\"op\" must be \"store\", \"search\" or \"retrieve\".")
+                };
+                return reply.ToString(Formatting.None);
+            }
+            catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidCastException)
+            {
+                return new JObject { ["error"] = ex.Message }.ToString(Formatting.None);
+            }
+        }
 
-            // ── DCS pre-filter (optional) ────────────────────────────────────
-            // When a DCS assembler is provided, classify the user message and
-            // use structured context routing to identify relevant message IDs.
-            // These are used to boost/re-rank embedding search results.
+        private static string Required(JObject req, string name)
+        {
+            var value = (string?)req[name];
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException($"\"{name}\" is required.");
+            return value;
+        }
+
+        // ── store ────────────────────────────────────────────────────────────
+
+        private static async Task<JObject> StoreAsync(JObject req, EmbeddingDatabaseNew db)
+        {
+            var requestId = Required(req, "requestId");
+            var request = Required(req, "request");
+            var response = (string?)req["response"];
+            var embed = (bool?)req["embed"] ?? true;
+
+            await db.AddRequestToEmbeddingDatabaseAsync(requestId, request, embed);
+            if (!string.IsNullOrWhiteSpace(response))
+                await db.UpdateTextResponse(requestId, response, embed);
+
+            return new JObject { ["requestId"] = requestId, ["stored"] = true };
+        }
+
+        // ── search (Layer 1) ─────────────────────────────────────────────────
+
+        private static async Task<JObject> SearchAsync(
+            JObject req, EmbeddingDatabaseNew db, DcsContextAssembler? dcsAssembler)
+        {
+            var requestId = Required(req, "requestId");
+            var query = Required(req, "query");
+            var topK = (int?)req["topK"] ?? 5;
+            var more = (bool?)req["more"] ?? false;
+
+            // The audit is written onto the request's own row, so it has to exist already.
+            if (await db.GetFeedbackDataByRequestIdAsync(requestId) == null)
+                throw new ArgumentException($"No entry with requestId '{requestId}'; send op \"store\" first.");
+
+            // MORE is allowed once per request, as before.
+            var prior = await LoadTraceAsync(db, requestId);
+            if (more && prior?.MoreRequested == true)
+                throw new ArgumentException("\"more\" was already used for this request.");
+
+            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > search \"{Truncate(query, 120)}\" requestId={requestId} topK={topK} more={more} dcs={(dcsAssembler != null ? "on" : "off")}");
+
             var trace = new ElectionTrace
             {
                 RequestId = requestId,
-                UserMessage = userMessage,
-                TopK = topK,
-                SilentMode = silentMode
+                UserMessage = query,
+                TopK = topK
             };
 
+            // DCS pre-filter (optional): classify the query, attach it to its continuity
+            // thread, and collect the message ids DCS considers relevant.
             HashSet<string>? dcsRelevantIds = null;
             if (dcsAssembler != null)
             {
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > DCS pre-filter: classifying user message...");
-                var queryKey = DcsIntentClassifier.Classify(userMessage);
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > DCS classified key: intents=[{string.Join(",", queryKey.IntentIds)}] domains=[{string.Join(",", queryKey.DomainIds)}]");
-
-                // Attach the query to its continuity thread so the DCN term of the similarity
-                // (0.3 weight) tells same-thread messages from the rest instead of being constant.
+                var queryKey = DcsIntentClassifier.Classify(query);
                 var queryDcn = dcsAssembler.FindMatchingDcn(queryKey);
                 if (queryDcn != null)
                     queryKey.DcnIds = new[] { queryDcn.DcnId };
                 trace.DcsQueryDcnId = queryDcn?.DcnId;
 
-                var dcsContext = dcsAssembler.AssembleContext(queryKey);
-                dcsRelevantIds = dcsContext
+                dcsRelevantIds = dcsAssembler.AssembleContext(queryKey)
                     .Select(m => m.MessageId)
                     .ToHashSet();
                 trace.DcsRelevantCount = dcsRelevantIds.Count;
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > DCS assembled {dcsRelevantIds.Count} relevant context messages: [{string.Join(", ", dcsRelevantIds)}]");
             }
 
-            // ── Step 1: Initial retrieval ────────────────────────────────────
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 1: Embedding search (topK={topK}, minSimilarity=0.00)");
-            var candidates = await db.SearchEmbeddingsAsync(
-                searchText: userMessage,
-                topK: topK,
-                minimumSimilarity: 0.00f,
-                searchLevel: 2);
-
-            var candidateDetails = string.Join(", ", candidates.Select(c => $"ID:{c.Id} sim={c.Similarity ?? 0:F3}"));
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 1: Found {candidates.Count} candidates: [{candidateDetails}]");
-
-            // When DCS provides relevant IDs, boost matching candidates to the top. DCS only
-            // reorders what the search already returned; it never adds an entry of its own.
+            // DCS only reorders what the search already returned; it never adds an entry of its own.
             bool IsBoosted(FeedbackDatabaseValues c) =>
                 dcsRelevantIds != null && dcsRelevantIds.Contains(c.RequestID ?? "");
 
             List<FeedbackDatabaseValues> Rank(List<FeedbackDatabaseValues> list)
             {
                 if (dcsRelevantIds == null || dcsRelevantIds.Count == 0) return list;
-                var boostedCount = list.Count(IsBoosted);
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > DCS boost reranking applied — {boostedCount} candidates boosted to top");
                 return list
                     .OrderByDescending(c => IsBoosted(c) ? 1 : 0)
                     .ThenByDescending(c => c.Similarity ?? 0.0)
                     .ToList();
             }
 
-            candidates = Rank(candidates);
-
-            // ── Step 2: Build summary list and candidate header ──────────────
-            var candidateIds = candidates.Select(c => c.Id).ToList();
+            var candidates = Rank(await db.SearchEmbeddingsAsync(
+                searchText: query, topK: topK, minimumSimilarity: 0.00f, searchLevel: 2));
             trace.Proposed.AddRange(candidates.Select(c => Propose(c, 1, IsBoosted(c))));
-            var candidateHeader = BuildCandidateHeader(candidates, offerMore: true);
 
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 2: Built candidate header ({candidates.Count} entries, {candidateHeader.Length} chars):");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- CANDIDATE HEADER SENT TO MODEL ----");
-            foreach (var line in candidateHeader.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > {line}");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- END CANDIDATE HEADER ----");
-
-            // ── Step 3: Phase 1 audit — write candidate IDs before inference ─
-            await db.UpdateRagCandidatesSurfacedAsync(requestId, candidateIds);
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 3: Phase 1 audit written — surfaced IDs: [{string.Join(", ", candidateIds)}]");
-
-            // ── Step 4 & 5: First inference — model evaluates summaries ──────
-            // The candidate header is transient: provided for this call only,
-            // never stored in the session's persistent Messages history.
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 4: Sending first inference (user message + candidate header)...");
-            var firstMsg = await session.SendWithTransientBackgroundAsync(
-                userMessage,
-                candidateHeader,
-                cancellationToken: cancellationToken);
-
-            var firstResponse = firstMsg.Content;
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 4: Model first response ({firstResponse.Length} chars):");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- MODEL FIRST RESPONSE ----");
-            foreach (var line in firstResponse.Split('\n'))
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > {line}");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- END MODEL FIRST RESPONSE ----");
-            trace.ModelReplies.Add(firstResponse);
-
-            // ── MORE: the next set of candidates, once, decided and run by the system ──
-            // The model can only ask; it cannot say how many or change any setting. The same
-            // search is repeated one set deeper (the similarity floor is already 0, so depth is
-            // the only thing left to widen) and everything is back to normal straight after.
-            if (IsMoreRequest(firstResponse))
+            string? note = null;
+            if (more)
             {
-                session.TrimLastTurn(); // the bare "MORE" reply is not part of the conversation
-                trace.MoreRequested = true;
-
+                // The same search one set deeper (the similarity floor is already 0, so depth is
+                // the only thing left to widen); the next topK entries are added to the first set.
                 var deeper = await db.SearchEmbeddingsAsync(
-                    searchText: userMessage,
-                    topK: topK * 2,
-                    minimumSimilarity: 0.00f,
-                    searchLevel: 2);
-                var offered = candidateIds.ToHashSet();
+                    searchText: query, topK: topK * 2, minimumSimilarity: 0.00f, searchLevel: 2);
+                var offered = candidates.Select(c => c.Id).ToHashSet();
                 var extra = Rank(deeper.Where(c => !offered.Contains(c.Id)).ToList())
                     .Take(topK)
                     .ToList();
+                trace.MoreRequested = true;
                 trace.MoreAddedCount = extra.Count;
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > MORE requested — {extra.Count} further candidates: [{string.Join(", ", extra.Select(c => c.Id))}]");
-
-                candidates = candidates.Concat(extra).ToList();
-                candidateIds = candidates.Select(c => c.Id).ToList();
                 trace.Proposed.AddRange(extra.Select(c => Propose(c, 2, IsBoosted(c))));
-
-                candidateHeader = BuildCandidateHeader(
-                    candidates,
-                    offerMore: false,
-                    note: extra.Count == 0 ? "No further candidates exist." : "Further candidates have been added below.");
-
-                await db.UpdateRagCandidatesSurfacedAsync(requestId, candidateIds);
-
-                var secondMsg = await session.SendWithTransientBackgroundAsync(
-                    userMessage,
-                    candidateHeader,
-                    cancellationToken: cancellationToken);
-                firstResponse = secondMsg.Content;
-                trace.ModelReplies.Add(firstResponse);
+                candidates = candidates.Concat(extra).ToList();
+                note = extra.Count == 0 ? "No further candidates exist." : "Further candidates have been added below.";
             }
 
-            // ── Step 6: Parse RETRIEVE command ───────────────────────────────
-            // Constrain to surfaced candidates — prevents a malformed or prompt-injected
-            // model response from fetching unrelated rows by arbitrary ID.
-            var rawElectedIds = ParseRetrieveIds(firstResponse);
-            var electedIds = rawElectedIds
-                .Where(id => candidateIds.Contains(id))
-                .ToList();
-            var rejectedIds = rawElectedIds.Except(electedIds).ToList();
+            var candidateIds = candidates.Select(c => c.Id).ToList();
+            var header = BuildCandidateHeader(candidates, offerMore: !more, note: note);
 
-            if (rawElectedIds.Count > 0)
+            // Phase 1 audit: the ids that were offered.
+            await db.UpdateRagCandidatesSurfacedAsync(requestId, candidateIds);
+            trace.DcsBoostedIds = trace.Proposed.Where(p => p.DcsBoosted).Select(p => p.Id).ToList();
+            await db.UpdateRagElectionLogAsync(requestId, trace);
+
+            return new JObject
             {
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 6: Parsed RETRIEVE IDs: [{string.Join(", ", rawElectedIds)}]");
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 6: After security filter (surfaced only): [{string.Join(", ", electedIds)}]{(rejectedIds.Count > 0 ? $" ({rejectedIds.Count} rejected: [{string.Join(", ", rejectedIds)}])" : "")}");
+                ["requestId"] = requestId,
+                ["candidates"] = new JArray(trace.Proposed.Select(p => new JObject
+                {
+                    ["id"] = p.Id,
+                    ["requestId"] = p.RequestID,
+                    ["similarity"] = p.Similarity,
+                    ["summary"] = p.SummaryShown,
+                    ["dcsBoosted"] = p.DcsBoosted,
+                    ["batch"] = p.Batch
+                })),
+                ["header"] = header,
+                ["moreAvailable"] = !more,
+                ["dcsQueryDcnId"] = trace.DcsQueryDcnId
+            };
+        }
+
+        // ── retrieve (Layers 2-3, 5) ─────────────────────────────────────────
+
+        private static async Task<JObject> RetrieveAsync(JObject req, EmbeddingDatabaseNew db)
+        {
+            var requestId = Required(req, "requestId");
+            var silent = (bool?)req["silent"] ?? false;
+            var reply = (string?)req["reply"];
+
+            List<int> rawIds;
+            if (req["ids"] is JArray idArray)
+                rawIds = idArray.Select(t => (int)t).Distinct().ToList();
+            else if (!string.IsNullOrWhiteSpace(reply))
+            {
+                if (IsMoreRequest(reply))
+                    throw new ArgumentException("For more candidates send op \"search\" with \"more\": true.");
+                rawIds = ParseRetrieveIds(reply);
             }
             else
+                throw new ArgumentException("\"ids\" or \"reply\" is required.");
+
+            var row = await db.GetFeedbackDataByRequestIdAsync(requestId)
+                ?? throw new ArgumentException($"No entry with requestId '{requestId}'.");
+
+            // Constrain to surfaced candidates: a malformed or prompt-injected reply cannot fetch
+            // unrelated rows by arbitrary id.
+            var surfaced = SurfacedIds(row);
+            var electedIds = rawIds.Where(surfaced.Contains).ToList();
+            var rejectedIds = rawIds.Except(electedIds).ToList();
+
+            var electedChunks = new List<FeedbackDatabaseValues>();
+            var chunkHashes = new List<string?>();
+            foreach (var id in electedIds)
             {
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 6: No RETRIEVE command found in model response");
+                var chunk = await db.GetFeedbackDataByIdAsync(id);
+                if (chunk == null) continue;
+                electedChunks.Add(chunk);
+                var embedding = chunk.RequestEmbedding ?? chunk.SummaryEmbedding;
+                chunkHashes.Add(embedding != null ? GenerateEmbeddingHash(embedding) : null);
             }
+            var electedHashes = chunkHashes.Where(h => h != null).Select(h => h!).ToList();
 
-            string finalResponse;
-            var electedHashes = new List<string>();
+            var context = electedChunks.Count == 0 ? string.Empty
+                : silent ? SynthesizeChunks(electedChunks) : FormatFullChunks(electedChunks);
 
-            if (electedIds.Count == 0 && (rawElectedIds.Count > 0 || IsMoreRequest(firstResponse)))
-            {
-                // The model asked for entries that were never offered (or asked for MORE a
-                // second time, which is refused). The command is not an answer: drop that turn
-                // from history and ask again with nothing to retrieve.
-                trace.Outcome = "rejected-retry";
-                session.TrimLastTurn();
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Retrieval request rejected — re-asking for a direct answer");
-                var retry = await session.SendWithTransientBackgroundAsync(
-                    userMessage,
-                    "No additional context is available for this request. Answer directly; do not ask to retrieve anything.",
-                    cancellationToken: cancellationToken);
-                finalResponse = retry.Content;
-            }
-            else if (electedIds.Count == 0)
-            {
-                // No retrieval requested — first response is the final response.
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > No retrieval — using first response as final");
-                finalResponse = firstResponse;
-            }
-            else
-            {
-                // Phase-1 added a (user, RETRIEVE) pair to persistent history.
-                // Remove it so only the final answer turn survives.
-                session.TrimLastTurn();
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Trimmed transient turn from session history");
-
-                // ── Step 7: Fetch elected chunks in parallel ─────────────────
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 7: Fetching {electedIds.Count} elected chunks...");
-                var chunkResults = await Task.WhenAll(
-                    electedIds.Select(id => db.GetFeedbackDataByIdAsync(id)));
-                var electedChunks = chunkResults
-                    .Where(c => c != null)
-                    .Cast<FeedbackDatabaseValues>()
-                    .ToList();
-
-                // Log each chunk's content
-                foreach (var chunk in electedChunks)
-                {
-                    var reqLen = chunk.Request?.Length ?? 0;
-                    var respLen = chunk.TextResponse?.Length ?? 0;
-                    var toolLen = chunk.ToolUseTextResponse?.Length ?? 0;
-                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 7: Chunk ID:{chunk.Id} — Request: \"{Truncate(chunk.Request ?? "", 80)}\" ({reqLen} chars), Response: \"{Truncate(chunk.TextResponse ?? "", 80)}\" ({respLen} chars){(toolLen > 0 ? $", ToolResponse: ({toolLen} chars)" : "")}");
-                }
-
-                // Compute 8-hex hash for each elected chunk.
-                foreach (var chunk in electedChunks)
-                {
-                    var embedding = chunk.RequestEmbedding ?? chunk.SummaryEmbedding;
-                    if (embedding != null)
-                        electedHashes.Add(GenerateEmbeddingHash(embedding));
-                }
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 7: Hashes: [{string.Join(", ", electedHashes)}]");
-
-                // Build the transient context for the second inference call.
-                string transientContext;
-                if (silentMode)
-                {
-                    // Layer 5: silent digestion — distil chunks; raw content never enters context.
-                    transientContext = SynthesizeChunks(electedChunks);
-                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 7: Built transient context (silentMode=true, synthesized, {transientContext.Length} chars)");
-                }
-                else
-                {
-                    // Standard ephemeral injection — full chunk text as transient background.
-                    // Summaries are omitted here; the model already evaluated them in Step 5.
-                    transientContext = FormatFullChunks(electedChunks);
-                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 7: Built transient context (silentMode=false, full chunks, {transientContext.Length} chars)");
-                }
-
-                trace.Outcome = "elected";
-                trace.Injected = silentMode ? "silent" : "full";
-                trace.InjectedChars = transientContext.Length;
-
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- TRANSIENT CONTEXT SENT TO MODEL ----");
-                foreach (var line in transientContext.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > {line}");
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- END TRANSIENT CONTEXT ----");
-
-                // ── Second inference with elected chunks (transient) ─────────
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 8: Sending second inference (user message + elected chunks)...");
-                var finalMsg = await session.SendWithTransientBackgroundAsync(
-                    userMessage,
-                    transientContext,
-                    cancellationToken: cancellationToken);
-
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 8: Model final response ({finalMsg.Content.Length} chars):");
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- MODEL FINAL RESPONSE ----");
-                foreach (var line in finalMsg.Content.Split('\n'))
-                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > {line}");
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > ---- END MODEL FINAL RESPONSE ----");
-
-                // ── Append [RAG:hash] tags to assistant turn ─────────────────
-                // Tags are ~5 tokens each. They carry no semantic content so cannot
-                // confuse future turns or pollute the embedding space if re-indexed.
-                var hashTags = string.Concat(electedHashes.Select(h => $" [RAG:{h}]"));
-                finalResponse = finalMsg.Content + hashTags;
-                Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 8: Appended hash tags: {hashTags.Trim()}");
-            }
-
-            // ── Step 9: Phase 2 audit — record elected hashes post-inference ─
-            await db.UpdateRagEntriesElectedAsync(requestId, electedHashes);
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Step 9: Phase 2 audit written — elected hashes: [{string.Join(", ", electedHashes)}]");
-
-            // Election record for review: proposed (in full), replies, choice, injection.
-            trace.ParsedIds = rawElectedIds;
+            // Phase 2 audit and election log.
+            var trace = await LoadTraceAsync(db, requestId) ?? new ElectionTrace { RequestId = requestId };
+            if (!string.IsNullOrWhiteSpace(reply)) trace.ModelReplies.Add(reply);
+            trace.SilentMode = silent;
+            trace.ParsedIds = rawIds;
             trace.ElectedIds = electedIds;
             trace.RejectedIds = rejectedIds;
             trace.ElectedHashes = electedHashes;
-            trace.DcsBoostedIds = trace.Proposed.Where(p => p.DcsBoosted).Select(p => p.Id).ToList();
+            trace.Injected = electedChunks.Count == 0 ? "none" : silent ? "silent" : "full";
+            trace.InjectedChars = context.Length;
+            trace.Outcome = electedChunks.Count > 0 ? "elected"
+                : rawIds.Count > 0 ? "rejected-retry" : "answered-directly";
+            await db.UpdateRagEntriesElectedAsync(requestId, electedHashes);
             await db.UpdateRagElectionLogAsync(requestId, trace);
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Election log written — outcome={trace.Outcome}, proposed={trace.Proposed.Count}, more={trace.MoreRequested}");
 
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > === EE-RAG Pipeline Complete ===");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Candidates surfaced: {candidateIds.Count}, Elected: {electedIds.Count}, Retrieval: {(electedIds.Count > 0 ? "yes" : "no")}");
-            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > Final response: {finalResponse.Length} chars");
+            Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > retrieve requestId={requestId} elected=[{string.Join(", ", electedIds)}] rejected=[{string.Join(", ", rejectedIds)}] outcome={trace.Outcome}");
 
-            return new EERagResult
+            var result = new JObject
             {
-                FinalResponse        = finalResponse,
-                CandidateHeader      = candidateHeader,
-                FirstResponse        = firstResponse,
-                CandidateIdsSurfaced = candidateIds,
-                ElectedIds           = electedIds,
-                ElectedHashes        = electedHashes,
-                MoreRequested        = trace.MoreRequested,
-                Election             = trace
+                ["requestId"] = requestId,
+                ["electedIds"] = new JArray(electedIds),
+                ["rejectedIds"] = new JArray(rejectedIds),
+                ["hashes"] = new JArray(electedHashes),
+                ["chunks"] = new JArray(electedChunks.Select((c, i) => new JObject
+                {
+                    ["id"] = c.Id,
+                    ["hash"] = chunkHashes[i],
+                    ["request"] = c.Request,
+                    ["response"] = c.TextResponse,
+                    ["toolResponse"] = c.ToolUseTextResponse
+                })),
+                ["context"] = context,
+                ["tags"] = string.Concat(electedHashes.Select(h => $" [RAG:{h}]"))
             };
+            if (trace.Outcome == "rejected-retry")
+                result["note"] = "No additional context is available for this request. Answer directly; do not ask to retrieve anything.";
+            return result;
+        }
+
+        private static HashSet<int> SurfacedIds(FeedbackDatabaseValues row)
+        {
+            if (string.IsNullOrWhiteSpace(row.MetaData)) return [];
+            var ids = JObject.Parse(row.MetaData)["RagCandidatesSurfaced"] as JArray;
+            return ids == null ? [] : ids.Select(t => (int)t).ToHashSet();
+        }
+
+        private static async Task<ElectionTrace?> LoadTraceAsync(EmbeddingDatabaseNew db, string requestId)
+        {
+            var row = await db.GetFeedbackDataByRequestIdAsync(requestId);
+            if (row == null || string.IsNullOrWhiteSpace(row.MetaData)) return null;
+            return JObject.Parse(row.MetaData)["RagElectionLog"]?.ToObject<ElectionTrace>();
         }
 
         // ── Utility: candidate header (Layer 1) ─────────────────────────────

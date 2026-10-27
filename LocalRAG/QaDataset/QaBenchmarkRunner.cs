@@ -1,10 +1,9 @@
-using AiMessagingCore.Abstractions;
 using System.Text;
 
 namespace LocalRAG.QaDataset
 {
     /// <summary>
-    /// Runs QA benchmark questions through an AI session and evaluates answers
+    /// Runs QA benchmark questions through the calling AI (askModel) and evaluates answers
     /// against the correct/incorrect prediction lists in the dataset.
     /// </summary>
     public static class QaBenchmarkRunner
@@ -12,7 +11,7 @@ namespace LocalRAG.QaDataset
         public static async Task<QaBenchmarkReport> RunAsync(
             QaBenchmarkOptions opts,
             QaDatasetDatabase db,
-            IChatSession session,
+            Func<string, Task<string>> askModel,
             IProgress<BenchmarkProgressUpdate>? progress = null,
             CancellationToken ct = default)
         {
@@ -61,8 +60,8 @@ namespace LocalRAG.QaDataset
                 try
                 {
                     var prompt = BuildPrompt(item, allEmbeddings, itemLookup, opts);
-                    var reply = await session.SendAsync(prompt, cancellationToken: ct);
-                    modelResponse = reply.Content ?? "";
+                    var reply = await askModel(prompt);
+                    modelResponse = reply ?? "";
                     (outcome, matchedAnswer) = EvaluateAnswer(modelResponse, item);
                 }
                 catch (OperationCanceledException)
