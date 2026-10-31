@@ -26,6 +26,8 @@ namespace LocalRAG
 
         private List<List<float[]>> _hashFunctions;
         private List<Dictionary<int, List<int>>> _hashTables;
+        // Guards every read and write of _hashTables: inserts run concurrently and are not queued (C1 #6).
+        private readonly object _lshLock = new();
 
         // Exact (brute-force) in-memory vector index: doc Id -> RequestEmbedding.
         // Populated alongside LSH. Lets retrieval score EVERY document instead of an
@@ -555,6 +557,10 @@ END;
         {
             if (string.IsNullOrWhiteSpace(searchText))
                 return new List<FeedbackDatabaseValues>();
+
+            // A search issued during start-up used to see a half-filled index, and a failed warm-up left it empty
+            // with nothing said. Wait for it; a failure is thrown here instead of returning BM25-only hits (C1 #5).
+            await EnsureReadyAsync();
 
             var mode = _config.FuzzyLexicalMode;
             // Whether the first pass uses fuzzy matching: forced by caller, or Always mode.
@@ -1175,14 +1181,26 @@ END;
             var record = await GetFeedbackDataByIdAsync(recordId);
             if (record == null) return;
 
-            // Remove old LSH entries (clear from all hash tables for this ID)
-            foreach (var hashTable in _hashTables)
+            // Remove old LSH entries (clear from all hash tables for this ID). A record with several vectors can sit
+            // in one bucket more than once, so remove every copy, not just the first.
+            lock (_lshLock)
             {
-                foreach (var bucket in hashTable.Values)
+                foreach (var hashTable in _hashTables)
                 {
-                    bucket.Remove(recordId);
+                    foreach (var bucket in hashTable.Values)
+                    {
+                        bucket.RemoveAll(x => x == recordId);
+                    }
                 }
             }
+
+            // The exact request-side index is otherwise only filled at insert and warm-up, so a row embedded later
+            // (backfill, a timed-out insert) or re-embedded with another model would stay invisible or stale to the
+            // default search until a restart (C1 #6).
+            if (record.RequestEmbedding != null) _exactVectors[recordId] = record.RequestEmbedding;
+            else _exactVectors.TryRemove(recordId, out _);
+            if (record.RequestEmbeddingList is { Count: > 0 }) _exactChunkVectors[recordId] = record.RequestEmbeddingList.ToArray();
+            else _exactChunkVectors.TryRemove(recordId, out _);
 
             // Re-add with new embeddings
             if (record.RequestEmbedding != null)
@@ -1216,9 +1234,12 @@ END;
             LogMessage("Rebuilding all LSH indexes...");
 
             // Clear all hash tables
-            foreach (var hashTable in _hashTables)
+            lock (_lshLock)
             {
-                hashTable.Clear();
+                foreach (var hashTable in _hashTables)
+                {
+                    hashTable.Clear();
+                }
             }
 
             // Reload from database
@@ -1301,11 +1322,6 @@ END;
         /// </summary>
         public async Task WarmIndexesFromDatabaseAsync(Action<int, int>? progress = null)
         {
-            _exactVectors.Clear();
-            _exactChunkVectors.Clear();
-            foreach (var hashTable in _hashTables)
-                hashTable.Clear();
-
             const string query =
                 "SELECT Id, RequestEmbedding, RequestEmbeddingList, " +
                 "TextResponseEmbedding, ToolUseTextResponseEmbedding, " +
@@ -1332,40 +1348,72 @@ END;
                 }
             }
 
-            int processed = 0;
+            // Decode every row first. One corrupt embedding JSON used to throw out of the whole warm-up, fault the
+            // unobserved start-up task and leave the exact index empty with nothing said; now that row is skipped,
+            // counted in WarmUpSkippedRecords and logged (C1 #5).
+            var decoded = new List<(int Id, float[]? Re, List<float[]>? Rel, List<float[]> Others)>(rows.Count);
+            int skipped = 0, seen = 0;
             foreach (var r in rows)
             {
-                var re = string.IsNullOrEmpty(r.RE) ? null : JsonConvert.DeserializeObject<float[]>(r.RE);
-                if (re != null)
+                try
                 {
-                    _exactVectors[r.Id] = re;
-                    InsertLSH(r.Id, re);
-                }
+                    var re = string.IsNullOrEmpty(r.RE) ? null : JsonConvert.DeserializeObject<float[]>(r.RE);
+                    var rel = string.IsNullOrEmpty(r.REL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.REL);
 
-                var rel = string.IsNullOrEmpty(r.REL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.REL);
-                if (rel != null && rel.Count > 0)
+                    // Response / tool embeddings contribute to LSH recall (not exact search).
+                    var others = new List<float[]>();
+                    var tre = string.IsNullOrEmpty(r.TRE) ? null : JsonConvert.DeserializeObject<float[]>(r.TRE);
+                    if (tre != null) others.Add(tre);
+                    var tutre = string.IsNullOrEmpty(r.TUTRE) ? null : JsonConvert.DeserializeObject<float[]>(r.TUTRE);
+                    if (tutre != null) others.Add(tutre);
+                    var trel = string.IsNullOrEmpty(r.TREL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.TREL);
+                    if (trel != null) others.AddRange(trel);
+                    var tutrel = string.IsNullOrEmpty(r.TUTREL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.TUTREL);
+                    if (tutrel != null) others.AddRange(tutrel);
+
+                    decoded.Add((r.Id, re, rel, others));
+                }
+                catch (Exception ex)
                 {
-                    _exactChunkVectors[r.Id] = rel.ToArray();
-                    foreach (var emb in rel) InsertLSH(r.Id, emb);
+                    skipped++;
+                    LogMessage($"Index warm-up skipped record {r.Id}: its stored embedding could not be read ({ex.Message}).");
                 }
-
-                // Response / tool embeddings contribute to LSH recall (not exact search).
-                var tre = string.IsNullOrEmpty(r.TRE) ? null : JsonConvert.DeserializeObject<float[]>(r.TRE);
-                if (tre != null) InsertLSH(r.Id, tre);
-                var tutre = string.IsNullOrEmpty(r.TUTRE) ? null : JsonConvert.DeserializeObject<float[]>(r.TUTRE);
-                if (tutre != null) InsertLSH(r.Id, tutre);
-                var trel = string.IsNullOrEmpty(r.TREL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.TREL);
-                if (trel != null) foreach (var emb in trel) InsertLSH(r.Id, emb);
-                var tutrel = string.IsNullOrEmpty(r.TUTREL) ? null : JsonConvert.DeserializeObject<List<float[]>>(r.TUTREL);
-                if (tutrel != null) foreach (var emb in tutrel) InsertLSH(r.Id, emb);
-
-                processed++;
-                progress?.Invoke(processed, rows.Count);
+                progress?.Invoke(++seen, rows.Count);
             }
 
-            if (processed > 0)
-                LogMessage($"Index warm-up complete. Loaded {processed} records into vector/LSH indexes.");
+            // Swap in under the lock that inserts take, so the LSH is never read half-built.
+            lock (_lshLock)
+            {
+                _exactVectors.Clear();
+                _exactChunkVectors.Clear();
+                foreach (var hashTable in _hashTables)
+                    hashTable.Clear();
+
+                foreach (var d in decoded)
+                {
+                    if (d.Re != null)
+                    {
+                        _exactVectors[d.Id] = d.Re;
+                        InsertLSH(d.Id, d.Re);
+                    }
+                    if (d.Rel != null && d.Rel.Count > 0)
+                    {
+                        _exactChunkVectors[d.Id] = d.Rel.ToArray();
+                        foreach (var emb in d.Rel) InsertLSH(d.Id, emb);
+                    }
+                    foreach (var emb in d.Others) InsertLSH(d.Id, emb);
+                }
+            }
+
+            WarmUpSkippedRecords = skipped;
+            if (skipped > 0)
+                LogMessage($"Index warm-up: {skipped} of {rows.Count} records are not searchable by vector until their embeddings are rebuilt (BackfillEmbeddingsAsync).");
+            if (decoded.Count > 0)
+                LogMessage($"Index warm-up complete. Loaded {decoded.Count} records into vector/LSH indexes.");
         }
+
+        /// <summary>Records the last warm-up could not read (corrupt stored embedding); they are left out of the vector indexes.</summary>
+        public int WarmUpSkippedRecords { get; private set; }
 
         #endregion
 
@@ -1530,14 +1578,20 @@ END;
         {
             LogMessage("Clearing all embedding data...");
 
+            await EnsureReadyAsync(); // a still-running warm-up would otherwise refill the indexes after the clear
+
             using var connection = await GetConnectionAsync();
             using var command = new SqliteCommand("DELETE FROM embeddings", connection);
             var deleted = await command.ExecuteNonQueryAsync();
 
-            // Clear LSH tables
-            foreach (var hashTable in _hashTables)
+            // Clear the in-memory indexes: the LSH tables and the exact vectors. Leaving the exact maps behind kept
+            // ghost vectors that crowded the top-K cut and were dropped after it (G4-3).
+            lock (_lshLock)
             {
-                hashTable.Clear();
+                foreach (var hashTable in _hashTables)
+                    hashTable.Clear();
+                _exactVectors.Clear();
+                _exactChunkVectors.Clear();
             }
 
             // Clear cache
@@ -1571,8 +1625,11 @@ END;
             stats.RecordsMissingEmbeddings = stats.TotalRecords - stats.RecordsWithEmbeddings;
 
             // LSH bucket stats
-            stats.TotalLSHBuckets = _hashTables.Sum(t => t.Count);
-            stats.TotalLSHEntries = _hashTables.Sum(t => t.Values.Sum(b => b.Count));
+            lock (_lshLock)
+            {
+                stats.TotalLSHBuckets = _hashTables.Sum(t => t.Count);
+                stats.TotalLSHEntries = _hashTables.Sum(t => t.Values.Sum(b => b.Count));
+            }
 
             return stats;
         }
@@ -2045,14 +2102,15 @@ LIMIT 100";
         private void InsertLSH(int id, float[] vector)
         {
             var hashCodes = ComputeLSH(vector);
-            for (int i = 0; i < _config.NumberOfHashTables; i++)
+            lock (_lshLock)
             {
-                int hashCode = hashCodes[i];
-                if (!_hashTables[i].ContainsKey(hashCode))
+                for (int i = 0; i < _config.NumberOfHashTables; i++)
                 {
-                    _hashTables[i][hashCode] = new List<int>();
+                    int hashCode = hashCodes[i];
+                    if (!_hashTables[i].TryGetValue(hashCode, out var bucket))
+                        _hashTables[i][hashCode] = bucket = new List<int>();
+                    bucket.Add(id);
                 }
-                _hashTables[i][hashCode].Add(id);
             }
         }
 
@@ -2061,11 +2119,14 @@ LIMIT 100";
             var hashCodes = ComputeLSH(queryVector);
             var candidateSet = new HashSet<int>();
 
-            for (int i = 0; i < _config.NumberOfHashTables; i++)
+            lock (_lshLock)
             {
-                if (_hashTables[i].TryGetValue(hashCodes[i], out var bucket))
+                for (int i = 0; i < _config.NumberOfHashTables; i++)
                 {
-                    candidateSet.UnionWith(bucket);
+                    if (_hashTables[i].TryGetValue(hashCodes[i], out var bucket))
+                    {
+                        candidateSet.UnionWith(bucket);
+                    }
                 }
             }
 
