@@ -462,24 +462,18 @@ namespace LocalRAG
         }
 
         /// <summary>
-        /// Helper to generate and set a single embedding with timeout protection.
+        /// Helper to generate and set a single embedding. On failure the setter gets null. There is no timeout here
+        /// (inference cannot be cancelled); the caller bounds how long it waits (see EmbeddingDatabaseNew.EmbedResponse).
         /// </summary>
         public async Task HandleSingleEmbedding(string? content, bool embedFlag, Action<float[]?> setter)
         {
             if (string.IsNullOrEmpty(content) || !embedFlag)
                 return;
 
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-
             try
             {
                 var embedding = await GetEmbeddingsAsync(content);
                 setter(embedding);
-            }
-            catch (OperationCanceledException)
-            {
-                Debug.WriteLine("Single embedding generation timed out.");
-                setter(null);
             }
             catch (Exception ex)
             {
@@ -489,24 +483,17 @@ namespace LocalRAG
         }
 
         /// <summary>
-        /// Helper to generate and set a list of embeddings with timeout protection.
+        /// Helper to generate and set a list of embeddings. On failure the setter gets null; the caller bounds the wait.
         /// </summary>
         public async Task HandleListEmbedding(string? content, bool embedFlag, Action<List<float[]>?> setter)
         {
             if (string.IsNullOrEmpty(content) || !embedFlag)
                 return;
 
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-
             try
             {
                 var embeddings = await SplitStringIntoEmbeddingsListAsync(content);
                 setter(embeddings);
-            }
-            catch (OperationCanceledException)
-            {
-                Debug.WriteLine("List embedding generation timed out.");
-                setter(null);
             }
             catch (Exception ex)
             {

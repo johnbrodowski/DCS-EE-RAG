@@ -11,7 +11,7 @@ using System.Text;
 
 namespace LocalRAG
 {
-    public class EmbeddingDatabaseNew : IDisposable
+    public class EmbeddingDatabaseNew : IDisposable, IAsyncDisposable
     {
         private readonly RAGConfiguration _config;
         private readonly EmbedderClassNew _embedder;
@@ -136,6 +136,14 @@ namespace LocalRAG
 
         // Completes when tables exist and in-memory indexes have been warmed from disk.
         private readonly Task _initTask;
+
+        private long _embeddingFailures;
+
+        /// <summary>Embeddings that could not be produced (failed or timed out) since this object was created. Those rows are stored without the vector.</summary>
+        public long EmbeddingFailures => Interlocked.Read(ref _embeddingFailures);
+
+        /// <summary>Raised when a row is stored without some of the embeddings that were asked for: (RequestID, names of the missing columns).</summary>
+        public event Action<string, IReadOnlyList<string>>? EmbeddingFailed;
 
         /// <summary>Awaitable that completes once startup (schema + index warm-up) is done.</summary>
         public Task EnsureReadyAsync() => _initTask ?? Task.CompletedTask;
@@ -527,21 +535,28 @@ END;
             if (string.IsNullOrEmpty(data.RequestID))
                 throw new ArgumentException("RequestID is required.", nameof(data.RequestID));
 
+            ObjectDisposedException.ThrowIf(_isDisposing, this);
+
             InvalidateCache(data.RequestID);
 
             var completionSource = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            await _queueSemaphore.WaitAsync();
+            // The slot is held until the update has run, so MaxQueueSize bounds queued-and-running updates (it used to be
+            // released straight after Enqueue and bounded nothing).
+            await _queueSemaphore.WaitAsync(_cancellationTokenSource.Token);
 
             try
             {
                 _updateQueue.Enqueue((data, completionSource));
+                // The processor may already have stopped and drained; do not leave this item waiting forever (C1 #7).
+                if (_isDisposing) CancelQueuedUpdates();
+                await completionSource.Task;
             }
             finally
             {
-                _queueSemaphore.Release();
+                // Again after the update ran: a read while it waited in the queue may have cached the old row (G4-15).
+                InvalidateCache(data.RequestID);
+                try { _queueSemaphore.Release(); } catch (ObjectDisposedException) { }
             }
-
-            await completionSource.Task;
         }
 
         #endregion
@@ -2168,6 +2183,8 @@ LIMIT 100";
         private async Task<FeedbackDatabaseValues> EmbedResponse(FeedbackDatabaseValues data)
         {
             var tasks = new List<Task>();
+            var requested = new List<(string Name, Func<bool> Arrived)>();
+            bool abandoned = false; // set on timeout: a late result must not write into a row that is already inserted
 
             // Chunk-list embeddings are the dominant ingestion cost (~N forward passes
             // per document). They can be disabled globally via IndexChunkEmbeddings when
@@ -2175,37 +2192,77 @@ LIMIT 100";
             bool chunks = _config.IndexChunkEmbeddings;
 
             if (chunks && data.EmbedRequestList && !string.IsNullOrEmpty(data.Request))
-                tasks.Add(_embedder.HandleListEmbedding(data.Request, true, list => data.RequestEmbeddingList = list));
+            {
+                tasks.Add(_embedder.HandleListEmbedding(data.Request, true, list => { if (!abandoned) data.RequestEmbeddingList = list; }));
+                requested.Add(("RequestEmbeddingList", () => data.RequestEmbeddingList != null));
+            }
 
             if (chunks && data.EmbedTextResponseList && !string.IsNullOrEmpty(data.TextResponse))
-                tasks.Add(_embedder.HandleListEmbedding(data.TextResponse, true, list => data.TextResponseEmbeddingList = list));
+            {
+                tasks.Add(_embedder.HandleListEmbedding(data.TextResponse, true, list => { if (!abandoned) data.TextResponseEmbeddingList = list; }));
+                requested.Add(("TextResponseEmbeddingList", () => data.TextResponseEmbeddingList != null));
+            }
 
             if (chunks && data.EmbedToolUseTextResponseList && !string.IsNullOrEmpty(data.ToolUseTextResponse))
-                tasks.Add(_embedder.HandleListEmbedding(data.ToolUseTextResponse, true, list => data.ToolUseTextResponseEmbeddingList = list));
+            {
+                tasks.Add(_embedder.HandleListEmbedding(data.ToolUseTextResponse, true, list => { if (!abandoned) data.ToolUseTextResponseEmbeddingList = list; }));
+                requested.Add(("ToolUseTextResponseEmbeddingList", () => data.ToolUseTextResponseEmbeddingList != null));
+            }
 
             if (chunks && data.EmbedSummaryList && !string.IsNullOrEmpty(data.Summary))
-                tasks.Add(_embedder.HandleListEmbedding(data.Summary, true, list => data.SummaryEmbeddingList = list));
+            {
+                tasks.Add(_embedder.HandleListEmbedding(data.Summary, true, list => { if (!abandoned) data.SummaryEmbeddingList = list; }));
+                requested.Add(("SummaryEmbeddingList", () => data.SummaryEmbeddingList != null));
+            }
 
             if (data.EmbedRequest && !string.IsNullOrEmpty(data.Request))
-                tasks.Add(_embedder.HandleSingleEmbedding(data.Request, true, emb => data.RequestEmbedding = emb));
+            {
+                tasks.Add(_embedder.HandleSingleEmbedding(data.Request, true, emb => { if (!abandoned) data.RequestEmbedding = emb; }));
+                requested.Add(("RequestEmbedding", () => data.RequestEmbedding != null));
+            }
 
             if (data.EmbedTextResponse && !string.IsNullOrEmpty(data.TextResponse))
-                tasks.Add(_embedder.HandleSingleEmbedding(data.TextResponse, true, emb => data.TextResponseEmbedding = emb));
+            {
+                tasks.Add(_embedder.HandleSingleEmbedding(data.TextResponse, true, emb => { if (!abandoned) data.TextResponseEmbedding = emb; }));
+                requested.Add(("TextResponseEmbedding", () => data.TextResponseEmbedding != null));
+            }
 
             if (data.EmbedToolUseTextResponse && !string.IsNullOrEmpty(data.ToolUseTextResponse))
-                tasks.Add(_embedder.HandleSingleEmbedding(data.ToolUseTextResponse, true, emb => data.ToolUseTextResponseEmbedding = emb));
+            {
+                tasks.Add(_embedder.HandleSingleEmbedding(data.ToolUseTextResponse, true, emb => { if (!abandoned) data.ToolUseTextResponseEmbedding = emb; }));
+                requested.Add(("ToolUseTextResponseEmbedding", () => data.ToolUseTextResponseEmbedding != null));
+            }
 
             if (data.EmbedSummary && !string.IsNullOrEmpty(data.Summary))
-                tasks.Add(_embedder.HandleSingleEmbedding(data.Summary, true, emb => data.SummaryEmbedding = emb));
+            {
+                tasks.Add(_embedder.HandleSingleEmbedding(data.Summary, true, emb => { if (!abandoned) data.SummaryEmbedding = emb; }));
+                requested.Add(("SummaryEmbedding", () => data.SummaryEmbedding != null));
+            }
 
             if (tasks.Count > 0)
             {
+                var all = Task.WhenAll(tasks);
                 var timeoutTask = Task.Delay(TimeSpan.FromSeconds(30));
-                var completedTask = await Task.WhenAny(Task.WhenAll(tasks), timeoutTask);
+                var completedTask = await Task.WhenAny(all, timeoutTask);
 
-                if (completedTask == timeoutTask)
+                bool timedOut = completedTask == timeoutTask;
+                if (timedOut)
                 {
-                    LogMessage($"Warning: Embedding generation timed out for RequestID: {data.RequestID}");
+                    abandoned = true;
+                    // Nobody awaits the stragglers any more; observe them so a fault does not go unnoticed.
+                    _ = all.ContinueWith(t => LogMessage($"Late embedding failure for RequestID {data.RequestID}: {t.Exception?.GetBaseException().Message}"),
+                        TaskContinuationOptions.OnlyOnFaulted);
+                }
+
+                // Whatever did not arrive (failed, or still running at the timeout) leaves the row without that vector,
+                // which makes it unreachable by the vector channel. Count it, log it and raise EmbeddingFailed (C1 #5).
+                var missing = requested.Where(r => !r.Arrived()).Select(r => r.Name).ToList();
+                if (missing.Count > 0)
+                {
+                    Interlocked.Add(ref _embeddingFailures, missing.Count);
+                    LogMessage($"Warning: {(timedOut ? "embedding generation timed out" : "embedding generation failed")} for RequestID {data.RequestID}; stored without: {string.Join(", ", missing)}");
+                    try { EmbeddingFailed?.Invoke(data.RequestID ?? string.Empty, missing); }
+                    catch (Exception ex) { LogMessage($"EmbeddingFailed handler threw: {ex.Message}"); }
                 }
             }
 
@@ -2632,34 +2689,55 @@ FROM embeddings WHERE RequestID = @RequestID";
 
         private void StartProcessor()
         {
+            var token = _cancellationTokenSource.Token;
             _processingTask = Task.Run(async () =>
             {
-                while (!_cancellationTokenSource.Token.IsCancellationRequested)
+                try
                 {
-                    if (_updateQueue.TryDequeue(out var item))
+                    while (!token.IsCancellationRequested)
                     {
-                        await _processingSemaphore.WaitAsync(_cancellationTokenSource.Token);
-                        try
+                        if (_updateQueue.TryDequeue(out var item))
                         {
-                            await UpdateDataInEmbeddingDatabaseAsyncInternal(item.data);
-                            item.completion.TrySetResult(true);
+                            try { await _processingSemaphore.WaitAsync(token); }
+                            catch (OperationCanceledException)
+                            {
+                                item.completion.TrySetCanceled(); // dequeued but never run: do not leave its caller waiting
+                                break;
+                            }
+                            try
+                            {
+                                await UpdateDataInEmbeddingDatabaseAsyncInternal(item.data);
+                                item.completion.TrySetResult(true);
+                            }
+                            catch (Exception ex)
+                            {
+                                item.completion.TrySetException(ex);
+                                LogMessage($"Error processing queue item: {ex.Message}");
+                            }
+                            finally
+                            {
+                                _processingSemaphore.Release();
+                            }
                         }
-                        catch (Exception ex)
+                        else
                         {
-                            item.completion.TrySetException(ex);
-                            LogMessage($"Error processing queue item: {ex.Message}");
+                            try { await Task.Delay(100, token); }
+                            catch (OperationCanceledException) { break; }
                         }
-                        finally
-                        {
-                            _processingSemaphore.Release();
-                        }
-                    }
-                    else
-                    {
-                        await Task.Delay(100, _cancellationTokenSource.Token);
                     }
                 }
-            }, _cancellationTokenSource.Token);
+                finally
+                {
+                    CancelQueuedUpdates();
+                }
+            });
+        }
+
+        /// <summary>Completes every update still waiting in the queue as cancelled, so awaiting callers are released at shutdown (C1 #7).</summary>
+        private void CancelQueuedUpdates()
+        {
+            while (_updateQueue.TryDequeue(out var item))
+                item.completion.TrySetCanceled();
         }
 
         #endregion
@@ -2679,34 +2757,45 @@ FROM embeddings WHERE RequestID = @RequestID";
 
             _cancellationTokenSource.Cancel();
 
+            bool stopped = true;
             try
             {
-                _processingTask?.Wait(TimeSpan.FromSeconds(5));
+                stopped = _processingTask?.Wait(TimeSpan.FromSeconds(5)) ?? true;
             }
-            catch { }
+            catch { } // a cancelled or faulted processor has finished
 
-            _cleanupTimer?.Dispose();
-            _cache.Clear();
-            _processingSemaphore.Dispose();
-            _queueSemaphore.Dispose();
-            _cancellationTokenSource.Dispose();
-            _embedder?.Dispose();
-            _reranker?.Dispose();
+            FinishDispose(stopped);
         }
 
-        public async Task DisposeAsync()
+        public async ValueTask DisposeAsync()
         {
             if (_isDisposing) return;
             _isDisposing = true;
 
             _cancellationTokenSource.Cancel();
 
-            try
+            bool stopped = true;
+            if (_processingTask != null)
             {
-                await Task.WhenAny(_processingTask ?? Task.CompletedTask, Task.Delay(TimeSpan.FromSeconds(30)));
+                var first = await Task.WhenAny(_processingTask, Task.Delay(TimeSpan.FromSeconds(30)));
+                stopped = first == _processingTask;
             }
-            catch { }
 
+            FinishDispose(stopped);
+        }
+
+        // Releases the native and synchronisation resources only once the processor has stopped; if it is still inside
+        // an update (an embedding call can outlast the wait), they are released when it ends rather than pulled out
+        // from under it (C1 #7).
+        private void FinishDispose(bool processorStopped)
+        {
+            CancelQueuedUpdates();
+            if (processorStopped || _processingTask == null) ReleaseResources();
+            else _ = _processingTask.ContinueWith(_ => ReleaseResources(), TaskScheduler.Default);
+        }
+
+        private void ReleaseResources()
+        {
             _cleanupTimer?.Dispose();
             _cache.Clear();
             _processingSemaphore.Dispose();
