@@ -215,6 +215,19 @@ public class RetrievalBenchmarkTests
         if (Environment.GetEnvironmentVariable("INDEX_CHUNKS") == "0")
             config.IndexChunkEmbeddings = false;
 
+        // Optional query-time switches, so one seeded database (BEIR_DB_PATH) can be searched several ways:
+        // FUZZY_MODE=Off|Fallback|Always, FUZZY_CANDIDATE_RECALL=1, USE_RERANKER=1 (+ RERANKER_MODEL_PATH / RERANKER_VOCAB_PATH).
+        if (Enum.TryParse<FuzzyLexicalMode>(Environment.GetEnvironmentVariable("FUZZY_MODE"), true, out var fuzzyMode))
+            config.FuzzyLexicalMode = fuzzyMode;
+        if (Environment.GetEnvironmentVariable("FUZZY_CANDIDATE_RECALL") == "1")
+            config.FuzzyCandidateRecall = true;
+        if (Environment.GetEnvironmentVariable("USE_RERANKER") == "1")
+        {
+            config.UseReranker = true;
+            if (Environment.GetEnvironmentVariable("RERANKER_MODEL_PATH") is { Length: > 0 } rm) config.RerankerModelPath = rm;
+            if (Environment.GetEnvironmentVariable("RERANKER_VOCAB_PATH") is { Length: > 0 } rv) config.RerankerVocabPath = rv;
+        }
+
         // Optional: force exact (USE_EXACT=1) or LSH (USE_EXACT=0) vector search.
         var useExact = Environment.GetEnvironmentVariable("USE_EXACT");
         if (useExact == "1") config.UseExactVectorSearch = true;

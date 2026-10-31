@@ -758,7 +758,7 @@ END;
         {
             // One embedding of the query serves the vector channel and the cosine of any hit
             // that only the keyword channel found.
-            float[] queryEmbedding = await _embedder.GetEmbeddingsAsync(searchText);
+            float[] queryEmbedding = await _embedder.GetQueryEmbeddingsAsync(searchText);
 
             // The vector channel is either approximate (LSH) or exact brute-force, per configuration.
             var ftsTask    = SearchWithFTSAsync(searchText, topK, searchLevel, fuzzy);
@@ -2149,7 +2149,7 @@ ORDER BY f.rank";
         {
             var results = new List<FeedbackDatabaseValues>();
 
-            float[]? searchEmbedding = await _embedder.GetEmbeddingsAsync(searchText);
+            float[]? searchEmbedding = await _embedder.GetQueryEmbeddingsAsync(searchText);
             if (searchEmbedding == null || searchEmbedding.Length == 0)
                 return results;
 
@@ -2176,7 +2176,7 @@ ORDER BY f.rank";
         /// top-K rows are loaded from the database.
         /// </summary>
         private async Task<List<FeedbackDatabaseValues>> SearchWithExactAsync(string searchText, int topK, float minimumSimilarity)
-            => await SearchWithExactAsync(await _embedder.GetEmbeddingsAsync(searchText), topK, minimumSimilarity);
+            => await SearchWithExactAsync(await _embedder.GetQueryEmbeddingsAsync(searchText), topK, minimumSimilarity);
 
         private async Task<List<FeedbackDatabaseValues>> SearchWithExactAsync(float[]? searchEmbedding, int topK, float minimumSimilarity)
         {

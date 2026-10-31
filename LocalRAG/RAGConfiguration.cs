@@ -74,6 +74,18 @@ namespace LocalRAG
         /// at least two minutes, because a model the server loads on demand can take that long to come up.
         /// </summary>
         public bool RemoteEmbeddingRequired { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_REQUIRED") is "1" or "true";
+        /// <summary>
+        /// Text put in front of every SEARCH QUERY before it is embedded (env DCS_EMBEDDING_QUERY_PREFIX). Many embedding models
+        /// are trained with one and score clearly lower without it: embeddinggemma "task: search result | query: ",
+        /// bge "Represent this sentence for searching relevant passages: ", e5 "query: ", nomic "search_query: ". Null/empty = none.
+        /// </summary>
+        public string? EmbeddingQueryPrefix { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_QUERY_PREFIX");
+        /// <summary>
+        /// Text put in front of every STORED DOCUMENT before it is embedded (env DCS_EMBEDDING_DOCUMENT_PREFIX): embeddinggemma
+        /// "title: none | text: ", e5 "passage: ", nomic "search_document: ". Null/empty = none. Changing it changes the vectors,
+        /// so the database model check asks for a re-embed.
+        /// </summary>
+        public string? EmbeddingDocumentPrefix { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_DOCUMENT_PREFIX");
         /// <summary>Timeout of each embedding request once the endpoint is in use.</summary>
         public int RemoteEmbeddingTimeoutSeconds { get; set; } = 60;
 

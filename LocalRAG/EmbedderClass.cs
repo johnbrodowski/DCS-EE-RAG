@@ -124,10 +124,16 @@ namespace LocalRAG
         /// Identifies the model and the settings that change the vectors it produces (model file, vocabulary, vector size,
         /// sequence length, casing, stop words). A database remembers it, so vectors from two models are never mixed (G4-10).
         /// </summary>
-        public string ModelFingerprint => _remote != null
+        public string ModelFingerprint => (_remote != null
             ? $"remote|{_remote.Model}|{_remote.Endpoint}|{_hiddenDim}|{_config.RemoveStopWords}"
             : $"{Path.GetFileName(_config.ModelPath)}|{new FileInfo(_config.ModelPath).Length}|{new FileInfo(_config.VocabularyPath).Length}" +
-            $"|{_hiddenDim}|{_config.MaxSequenceLength}|{_config.LowercaseInput}|{_config.RemoveStopWords}";
+            $"|{_hiddenDim}|{_config.MaxSequenceLength}|{_config.LowercaseInput}|{_config.RemoveStopWords}") + PrefixTag;
+
+        /// <summary>Empty without prefixes, so databases made before the prefix settings existed keep their fingerprint.</summary>
+        private string PrefixTag =>
+            string.IsNullOrEmpty(_config.EmbeddingQueryPrefix) && string.IsNullOrEmpty(_config.EmbeddingDocumentPrefix)
+                ? ""
+                : $"|qp={_config.EmbeddingQueryPrefix}|dp={_config.EmbeddingDocumentPrefix}";
 
         private int GetHiddenDimensionFromModel()
         {
@@ -182,26 +188,40 @@ namespace LocalRAG
             }
         }
 
-        private async Task<float[]> GetEmbeddingsInternalAsync(string textToEmbed)
-        {
-            if (_cacheDir == null) return await ComputeEmbeddingAsync(textToEmbed);
+        private string DocumentPrefix => _config.EmbeddingDocumentPrefix ?? "";
+        private string QueryPrefix => _config.EmbeddingQueryPrefix ?? "";
 
-            var key = CacheKey(textToEmbed);
-            if (key == null) return await ComputeEmbeddingAsync(textToEmbed);   // empty text: fails exactly as before
+        /// <summary>Embeds a search query: like <see cref="GetEmbeddingsAsync"/> but with <see cref="RAGConfiguration.EmbeddingQueryPrefix"/>.</summary>
+        public async Task<float[]> GetQueryEmbeddingsAsync(string queryText)
+        {
+            if (string.IsNullOrWhiteSpace(queryText))
+                throw new ArgumentException("Text to embed cannot be null or empty.", nameof(queryText));
+
+            return await GetEmbeddingsInternalAsync(queryText, QueryPrefix);
+        }
+
+        private Task<float[]> GetEmbeddingsInternalAsync(string textToEmbed) => GetEmbeddingsInternalAsync(textToEmbed, DocumentPrefix);
+
+        private async Task<float[]> GetEmbeddingsInternalAsync(string textToEmbed, string prefix)
+        {
+            if (_cacheDir == null) return await ComputeEmbeddingAsync(textToEmbed, prefix);
+
+            var key = CacheKey(textToEmbed, prefix);
+            if (key == null) return await ComputeEmbeddingAsync(textToEmbed, prefix);   // empty text: fails exactly as before
             var path = Path.Combine(_cacheDir, key[..2], key + ".bin");
             var hit = ReadCachedVector(path);
             if (hit != null) return hit;
-            var vector = await ComputeEmbeddingAsync(textToEmbed);
+            var vector = await ComputeEmbeddingAsync(textToEmbed, prefix);
             WriteCachedVector(path, vector);
             return vector;
         }
 
-        private string? CacheKey(string textToEmbed)
+        private string? CacheKey(string textToEmbed, string prefix)
         {
             var t = _config.RemoveStopWords ? RemoveStopWords(textToEmbed) : textToEmbed;
             t = NormalizeWhitespace(t);
             if (string.IsNullOrWhiteSpace(t)) return null;
-            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(_cacheSalt + "\n" + t))).ToLowerInvariant();
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(_cacheSalt + "\n" + prefix + "\n" + t))).ToLowerInvariant();
         }
 
         private static float[]? ReadCachedVector(string path)
@@ -232,7 +252,7 @@ namespace LocalRAG
             catch { /* a failed write only loses the speed-up */ }
         }
 
-        private async Task<float[]> ComputeEmbeddingAsync(string textToEmbed)
+        private async Task<float[]> ComputeEmbeddingAsync(string textToEmbed, string prefix)
         {
             var text = textToEmbed;
 
@@ -246,6 +266,8 @@ namespace LocalRAG
 
             if (string.IsNullOrWhiteSpace(text))
                 throw new ArgumentException("Text is empty after preprocessing.", nameof(textToEmbed));
+
+            text = prefix + text;
 
             // Encode to the text's real length, then pad only to PaddedLength (not always 512).
             if (_remote != null) return await ComputeRemoteAsync(new[] { text }, new[] { textToEmbed }).ContinueWith(t => t.Result[0]);
@@ -423,7 +445,7 @@ namespace LocalRAG
                 p = NormalizeWhitespace(p);
                 if (string.IsNullOrWhiteSpace(p)) continue;
                 raw.Add(t);
-                processed.Add(p);
+                processed.Add(DocumentPrefix + p);
             }
 
             int n = processed.Count;

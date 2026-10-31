@@ -52,6 +52,13 @@ namespace LocalRAG.Benchmarks
                 progress?.Report(
                     $"[{i + 1}/{dataset.KnowledgeEntries.Count}] Seeding '{entry.Slug}'...");
 
+                // A reused database (BEIR_DB_PATH) already holds this entry: keep it instead of embedding it again.
+                if (await db.GetFeedbackDataByRequestIdAsync(requestId) is { } stored)
+                {
+                    slugToId[entry.Slug] = stored.Id;
+                    continue;
+                }
+
                 await db.AddRequestToEmbeddingDatabaseAsync(
                     requestId, entry.Request, embed: generateEmbeddings);
 

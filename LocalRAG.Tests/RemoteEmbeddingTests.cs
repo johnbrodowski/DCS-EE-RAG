@@ -15,6 +15,7 @@ public class RemoteEmbeddingTests
         public string Url { get; }
         public int Requests;
         public string? LastModel;
+        public List<string> LastInputs = new();
 
         public FakeEndpoint()
         {
@@ -32,6 +33,7 @@ public class RemoteEmbeddingTests
                     Interlocked.Increment(ref Requests);
                     LastModel = body.RootElement.GetProperty("model").GetString();
                     var inputs = body.RootElement.GetProperty("input").EnumerateArray().Select(x => x.GetString()!).ToList();
+                    LastInputs = inputs;
                     // A vector whose direction depends on the text's length, not unit length, returned out of order on purpose.
                     var data = inputs.Select((s, i) => new { index = i, embedding = new[] { 3f + s.Length, 4f, 0f }, @object = "embedding" })
                                      .Reverse().ToArray();
@@ -66,6 +68,36 @@ public class RemoteEmbeddingTests
         Assert.Equal(3, v.Length);
         Assert.Equal(1.0, Math.Sqrt(v.Sum(x => (double)x * x)), 4);
         Assert.Equal("emb", server.LastModel);
+    }
+
+    [Fact]
+    public async Task QueriesAndDocuments_GetTheirOwnPrefix()
+    {
+        using var server = new FakeEndpoint();
+        var cfg = Config(server.Url);
+        cfg.EmbeddingQueryPrefix = "Q: ";
+        cfg.EmbeddingDocumentPrefix = "D: ";
+        using var embedder = new EmbedderClassNew(cfg);
+
+        await embedder.GetEmbeddingsAsync("some  document");
+        Assert.Equal("D: some document", server.LastInputs[0]);
+
+        await embedder.GetQueryEmbeddingsAsync("a question");
+        Assert.Equal("Q: a question", server.LastInputs[0]);
+
+        await embedder.SplitStringIntoEmbeddingsListAsync(string.Join(' ', Enumerable.Range(0, 100).Select(i => "w" + i)));
+        Assert.All(server.LastInputs, s => Assert.StartsWith("D: ", s));
+
+        // Different prefixes make different vectors, so the database must see a different model.
+        Assert.Contains("qp=Q: ", embedder.ModelFingerprint);
+    }
+
+    [Fact]
+    public void NoPrefix_KeepsTheOldFingerprint()
+    {
+        using var server = new FakeEndpoint();
+        using var embedder = new EmbedderClassNew(Config(server.Url));
+        Assert.DoesNotContain("qp=", embedder.ModelFingerprint);
     }
 
     [Fact]
