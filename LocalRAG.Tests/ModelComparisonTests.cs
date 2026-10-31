@@ -119,7 +119,9 @@ public class ModelComparisonTests
         }
 
         // A model loaded on demand makes the server fail other requests while it loads, so load them one at a time first.
-        foreach (var (label, cfg) in entries.Where(e => e.Cfg.RemoteEmbeddingUrl != null))
+        // Only useful when they run together: one at a time, each model is loaded by its own first request and a
+        // preload would just make the server load, evict and load it again.
+        foreach (var (label, cfg) in entries.Where(e => e.Cfg.RemoteEmbeddingUrl != null && Environment.GetEnvironmentVariable("SWEEP_SEQUENTIAL") != "1"))
         {
             using var warm = new RemoteEmbeddingClient(cfg);
             for (int attempt = 0; attempt < 3 && !await warm.ProbeAsync(180000); attempt++)
