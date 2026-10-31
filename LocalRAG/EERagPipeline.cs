@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -382,11 +383,39 @@ namespace LocalRAG
             return sb.ToString();
         }
 
+        /// <summary>Longest stored Summary shown to the model; a longer one is cut.</summary>
+        public const int SummaryCharCap = 300;
+
+        private static readonly Regex WhitespaceOrControl = new(@"[\s\p{Cc}\p{Zl}\p{Zp}]+", RegexOptions.Compiled);
+        private static readonly Regex IdTag = new(@"\[\s*ID\s*:", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex LineBreaks = new(@"\r\n|[\r\u0085\u2028\u2029]", RegexOptions.Compiled);
+        private static readonly Regex ControlChars = new(@"[\p{Cc}-[\n\t]]", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Stored text as one line: line breaks and control characters become single spaces, and an embedded
+        /// "[ID:n]" is defused, so an entry cannot start a line of its own or pass for a candidate (C1 #3).
+        /// </summary>
+        private static string OneLine(string? text) =>
+            IdTag.Replace(WhitespaceOrControl.Replace(text ?? string.Empty, " ").Trim(), "(ID:");
+
+        /// <summary>
+        /// Appends "  label: text" and indents every further line of the text under a "|", so stored text can
+        /// never begin a line with the block's own markers ("---", "Entry n:", "NOTE:") (C1 #3).
+        /// </summary>
+        private static void AppendQuoted(StringBuilder sb, string label, string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            var lines = ControlChars.Replace(LineBreaks.Replace(text.Trim(), "\n"), " ").Split('\n');
+            sb.AppendLine($"  {label}: {lines[0]}");
+            for (int i = 1; i < lines.Length; i++)
+                sb.AppendLine($"  | {lines[i]}");
+        }
+
         /// <summary>The one-line summary the model sees: the stored Summary, else the start of the Request.</summary>
         private static string SummaryText(FeedbackDatabaseValues c) =>
             !string.IsNullOrWhiteSpace(c.Summary)
-                ? c.Summary.Trim()
-                : TruncateToTokenBudget(c.Request ?? string.Empty, 150);
+                ? TruncateToTokenBudget(OneLine(c.Summary), SummaryCharCap)
+                : TruncateToTokenBudget(OneLine(c.Request), 150);
 
         /// <summary>
         /// True when the whole reply is the bare word MORE (case-insensitive, trailing punctuation allowed).
@@ -426,47 +455,30 @@ namespace LocalRAG
 
         // ── Utility: RETRIEVE command parser (Layer 2) ───────────────────────
 
+        // The whole first line: "RETRIEVE 7", "retrieve 3 7 12", "RETRIEVE 3, 7." (a little markup around it is fine).
+        private static readonly Regex RetrieveCommand = new(
+            @"^\W*RETRIEVE\s+((?:[0-9]+[\s,]*)+)\W*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
         /// <summary>
-        /// Extracts integer IDs from a "RETRIEVE n [n ...]" command in the model's response.
-        /// Handles: "RETRIEVE 7", "RETRIEVE 3 7 12", case-insensitive, any surrounding text.
-        /// Returns an empty list if no RETRIEVE command is present.
+        /// Extracts integer IDs from a "RETRIEVE n [n ...]" command. The command has to be the first line of the
+        /// reply (the prompt asks for EXACTLY that); "you can retrieve 3 records" inside an answer is prose, not an
+        /// election. Ids are plain ASCII digits that fit an int and are above zero; anything else is ignored rather
+        /// than thrown (C1 #4). Returns an empty list when the reply is not a RETRIEVE command.
         /// </summary>
         public static List<int> ParseRetrieveIds(string response)
         {
             if (string.IsNullOrWhiteSpace(response))
                 return [];
 
-            // Primary: RETRIEVE followed by one or more integers (space or comma separated).
-            var match = Regex.Match(
-                response,
-                @"RETRIEVE\s+([\d\s,]+)",
-                RegexOptions.IgnoreCase);
+            var match = RetrieveCommand.Match(response.TrimStart().Split('\n', 2)[0]);
+            if (!match.Success)
+                return [];
 
-            if (match.Success)
-                return Regex.Matches(match.Groups[1].Value, @"\d+")
-                    .Select(m => int.Parse(m.Value))
-                    .Distinct()
-                    .ToList();
-
-            // Fallback: model described an entry as relevant using [ID:N] notation but didn't
-            // use the RETRIEVE keyword.  Only activate when the response clearly indicates
-            // intent to retrieve (mentions "relevant", "retrieve", "most relevant", etc.).
-            bool indicatesRetrieval = Regex.IsMatch(
-                response,
-                @"\b(relevant|retrieve|elect|useful|helpful|applies|related)\b",
-                RegexOptions.IgnoreCase);
-
-            if (indicatesRetrieval)
-            {
-                var ids = Regex.Matches(response, @"\[ID:(\d+)\]", RegexOptions.IgnoreCase)
-                    .Select(m => int.Parse(m.Groups[1].Value))
-                    .Distinct()
-                    .ToList();
-                if (ids.Count > 0)
-                    return ids;
-            }
-
-            return [];
+            var ids = new List<int>();
+            foreach (Match m in Regex.Matches(match.Groups[1].Value, "[0-9]+"))
+                if (int.TryParse(m.Value, NumberStyles.None, CultureInfo.InvariantCulture, out var id) && id > 0 && !ids.Contains(id))
+                    ids.Add(id);
+            return ids;
         }
 
         // ── Utility: embedding hash (Layer 3) ────────────────────────────────
@@ -501,12 +513,9 @@ namespace LocalRAG
             foreach (var chunk in chunks)
             {
                 sb.AppendLine($"Entry {chunk.Id}:");
-                if (!string.IsNullOrWhiteSpace(chunk.Request))
-                    sb.AppendLine($"  Request: {chunk.Request}");
-                if (!string.IsNullOrWhiteSpace(chunk.TextResponse))
-                    sb.AppendLine($"  Response: {chunk.TextResponse}");
-                if (!string.IsNullOrWhiteSpace(chunk.ToolUseTextResponse))
-                    sb.AppendLine($"  Tool Response: {chunk.ToolUseTextResponse}");
+                AppendQuoted(sb, "Request", chunk.Request);
+                AppendQuoted(sb, "Response", chunk.TextResponse);
+                AppendQuoted(sb, "Tool Response", chunk.ToolUseTextResponse);
                 sb.AppendLine();
             }
 
@@ -531,14 +540,14 @@ namespace LocalRAG
                 var keyFacts = new List<string>();
 
                 if (!string.IsNullOrWhiteSpace(chunk.Summary))
-                    keyFacts.Add(chunk.Summary.Trim());
+                    keyFacts.Add(TruncateToTokenBudget(OneLine(chunk.Summary), SummaryCharCap));
                 else if (!string.IsNullOrWhiteSpace(chunk.Request))
-                    keyFacts.Add(TruncateToTokenBudget(chunk.Request, 100));
+                    keyFacts.Add(TruncateToTokenBudget(OneLine(chunk.Request), 100));
 
                 if (!string.IsNullOrWhiteSpace(chunk.TextResponse))
-                    keyFacts.Add(TruncateToTokenBudget(chunk.TextResponse, 200));
+                    keyFacts.Add(TruncateToTokenBudget(OneLine(chunk.TextResponse), 200));
 
-                sb.AppendLine(string.Join(" | ", keyFacts));
+                sb.AppendLine("- " + string.Join(" | ", keyFacts));
             }
 
             sb.AppendLine("---");
