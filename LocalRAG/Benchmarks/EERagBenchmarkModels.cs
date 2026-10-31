@@ -63,6 +63,8 @@ namespace LocalRAG.Benchmarks
         public int TopK { get; set; } = 5;
         public bool SilentMode { get; set; } = false;
         public bool SeedFreshDatabase { get; set; } = true;
+        /// <summary>The run stops after this many failed cases in a row (a bad key, a rate limit). 0 never stops it.</summary>
+        public int MaxConsecutiveErrors { get; set; } = 5;
     }
 
     public class CaseResult
@@ -82,6 +84,8 @@ namespace LocalRAG.Benchmarks
         public string? AnswerHint { get; set; }
         public bool AnswerHintMatched { get; set; }
         public string FirstResponse { get; set; } = string.Empty;
+        /// <summary>Set when the case could not be run (the model call or the pipeline threw). Such a case is in no mean.</summary>
+        public string? Error { get; set; }
     }
 
     public class BenchmarkReport
@@ -98,6 +102,20 @@ namespace LocalRAG.Benchmarks
         public List<CaseResult> CaseResults { get; set; } = [];
         public string DatasetName { get; set; } = string.Empty;
 
+        /// <summary>Cases that failed to run. They are left out of every mean below.</summary>
+        public int ErroredCases { get; set; }
+        /// <summary>Why the run stopped early (repeated failures), or null.</summary>
+        public string? AbortReason { get; set; }
+        /// <summary>Cases where retrieval is expected. The means below are over these only: a case with nothing to find scores 1.0 by definition and would lift them.</summary>
+        public int PositiveCases { get; set; }
+        public double PositiveMeanCandidateRecall { get; set; }
+        public double PositiveMeanPrecision { get; set; }
+        public double PositiveMeanRecall { get; set; }
+        public double PositiveMeanF1 { get; set; }
+        /// <summary>Cases where nothing should be retrieved, and the share where nothing was.</summary>
+        public int NegativeCases { get; set; }
+        public double NegativeCorrectRate { get; set; }
+
         public string FormatSummary()
         {
             var sb = new StringBuilder();
@@ -111,6 +129,12 @@ namespace LocalRAG.Benchmarks
             sb.AppendLine($"Mean Retrieval Recall    : {MeanRetrievalRecall:P1}");
             sb.AppendLine($"Mean F1                  : {MeanF1:P1}");
             sb.AppendLine($"Retrieval Rate (Actual)  : {RetrievalRateActual:P1}  (Expected: {RetrievalRateExpected:P1})");
+            sb.AppendLine($"Positive cases ({PositiveCases}) : candidate recall {PositiveMeanCandidateRecall:P1}, precision {PositiveMeanPrecision:P1}, recall {PositiveMeanRecall:P1}, F1 {PositiveMeanF1:P1}");
+            sb.AppendLine($"Negative cases ({NegativeCases}) : nothing retrieved in {NegativeCorrectRate:P1}");
+            if (ErroredCases > 0)
+                sb.AppendLine($"ERRORS: {ErroredCases} case(s) could not be run and are in no figure above.");
+            if (AbortReason != null)
+                sb.AppendLine($"RUN STOPPED EARLY: {AbortReason}");
             sb.AppendLine();
             sb.AppendLine("--- Per-Case Results ---");
             foreach (var r in CaseResults)
@@ -118,6 +142,12 @@ namespace LocalRAG.Benchmarks
                 var hint = r.AnswerHint != null
                     ? (r.AnswerHintMatched ? "[hint ok]" : "[hint MISS]")
                     : "";
+                if (r.Error != null)
+                {
+                    sb.AppendLine($"  {r.CaseId,-8} ERROR: {r.Error}");
+                    sb.AppendLine($"           Query: {r.Query}");
+                    continue;
+                }
                 sb.AppendLine(
                     $"  {r.CaseId,-8} F1={r.F1:F2}  P={r.Precision:F2}  R={r.Recall:F2}" +
                     $"  CandRec={r.CandidateRecall:F2}  Ret={r.ActualRetrieval}  {hint}");

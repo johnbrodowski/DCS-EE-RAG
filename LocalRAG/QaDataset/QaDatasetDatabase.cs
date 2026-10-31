@@ -304,7 +304,8 @@ namespace LocalRAG.QaDataset
                     QaItemId = reader.GetInt32(2),
                     Question = reader.GetString(3),
                     ModelResponse = reader.IsDBNull(4) ? null : reader.GetString(4),
-                    Outcome = Enum.Parse<QaOutcome>(reader.GetString(5)),
+                    // A name from an older/newer version must not make the whole run unreadable.
+                    Outcome = Enum.TryParse<QaOutcome>(reader.GetString(5), out var outcome) ? outcome : QaOutcome.Indeterminate,
                     MatchedAnswer = reader.IsDBNull(6) ? null : reader.GetString(6),
                     RunAt = reader.GetDateTime(7)
                 });

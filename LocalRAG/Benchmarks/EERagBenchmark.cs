@@ -148,6 +148,8 @@ namespace LocalRAG.Benchmarks
             options ??= new BenchmarkOptions();
             var totalSw = Stopwatch.StartNew();
             var caseResults = new List<CaseResult>();
+            int consecutiveErrors = 0;
+            string? abortReason = null;
 
             for (int i = 0; i < dataset.Cases.Count; i++)
             {
@@ -162,8 +164,37 @@ namespace LocalRAG.Benchmarks
 
                 // askModel is the calling AI. Each case is independent: askModel must not carry
                 // conversation history from one case into the next.
-                var result = await RunCaseAsync(
-                    benchCase.Query, requestId, askModel, db, options.TopK, options.SilentMode);
+                CaseOutcome result;
+                try
+                {
+                    result = await RunCaseAsync(
+                        benchCase.Query, requestId, askModel, db, options.TopK, options.SilentMode);
+                    consecutiveErrors = 0;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // One provider error (rate limit, network) used to throw out of the loop and discard every
+                    // earlier case. Record it, leave it out of the means, and stop only if it keeps happening.
+                    caseResults.Add(new CaseResult
+                    {
+                        CaseId = benchCase.Id,
+                        Query = benchCase.Query,
+                        ExpectedRetrieval = benchCase.ExpectRetrieval,
+                        Duration = caseSw.Elapsed,
+                        Error = ex.Message
+                    });
+                    caseProgress?.Report(caseResults[^1]);
+                    if (options.MaxConsecutiveErrors > 0 && ++consecutiveErrors >= options.MaxConsecutiveErrors)
+                    {
+                        abortReason = $"{consecutiveErrors} cases failed in a row; the last error was: {ex.Message}";
+                        break;
+                    }
+                    continue;
+                }
 
                 caseSw.Stop();
 
@@ -209,7 +240,9 @@ namespace LocalRAG.Benchmarks
             }
 
             totalSw.Stop();
-            return BuildReport(dataset.Name, caseResults, totalSw.Elapsed);
+            var report = BuildReport(dataset.Name, caseResults, totalSw.Elapsed);
+            report.AbortReason = abortReason;
+            return report;
         }
 
         // ── Scoring helpers ───────────────────────────────────────────────────
@@ -246,13 +279,27 @@ namespace LocalRAG.Benchmarks
             List<CaseResult> results,
             TimeSpan totalDuration)
         {
+            var errored = results.Where(r => r.Error != null).ToList();
+            var all = results;            // the CaseResults list keeps the errored cases; the figures below do not
+            results = results.Where(r => r.Error == null).ToList();
+            var positives = results.Where(r => r.ExpectedRetrieval).ToList();
+            var negatives = results.Where(r => !r.ExpectedRetrieval).ToList();
+
             return new BenchmarkReport
             {
                 RunAt                  = DateTime.UtcNow,
                 TotalDuration          = totalDuration,
-                TotalCases             = results.Count,
+                TotalCases             = all.Count,
                 DatasetName            = datasetName,
-                CaseResults            = results,
+                CaseResults            = all,
+                ErroredCases           = errored.Count,
+                PositiveCases          = positives.Count,
+                PositiveMeanCandidateRecall = positives.Count > 0 ? positives.Average(r => r.CandidateRecall) : 0,
+                PositiveMeanPrecision  = positives.Count > 0 ? positives.Average(r => r.Precision) : 0,
+                PositiveMeanRecall     = positives.Count > 0 ? positives.Average(r => r.Recall) : 0,
+                PositiveMeanF1         = positives.Count > 0 ? positives.Average(r => r.F1) : 0,
+                NegativeCases          = negatives.Count,
+                NegativeCorrectRate    = negatives.Count > 0 ? (double)negatives.Count(r => !r.ActualRetrieval) / negatives.Count : 0,
                 MeanCandidateRecall    = results.Count > 0
                     ? results.Average(r => r.CandidateRecall) : 0,
                 MeanRetrievalPrecision = results.Count > 0
