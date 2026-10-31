@@ -3,7 +3,7 @@
 A retrieval-augmented generation system combining two complementary architectures:
 
 - **EE-RAG** (Elective Ephemeral RAG) — A five-layer pipeline where the model decides what to retrieve, and all retrieved content remains transient — never entering conversation history.
-- **DCS** (Dynamic Context Selection) — A deterministic routing layer that structures context using hierarchical identifiers (intent, domain, continuity nodes) rather than embedding similarity alone.
+- **DCS** (Dynamic Context Selection) — A routing layer that structures context using hierarchical identifiers (intent, domain, continuity nodes) rather than embedding similarity alone.
 
 Together they attempt solve the core problem of long-context reasoning: selecting relevant information from extended interactions without flooding the context, contaminating history, or introducing noise.
 
@@ -40,7 +40,7 @@ Each elected chunk is tagged with an 8-hex embedding hash (`[RAG:a3f9b2c1]`) for
 
 **Hybrid search.** Each query runs two channels and fuses them by rank (reciprocal rank fusion, so cosine and BM25 scales never have to agree): exact cosine search over every stored vector, and BM25 over a stemmed (porter) full-text index. `minimumSimilarity` is a cosine floor: every result's `Similarity` is its cosine against the query, and a keyword-only hit must clear the same floor. Fuzzy mode keeps its token-level scorer for typo tolerance. A third hash-bucket "memory" channel exists but is off by default (`UseMemoryChannel`): on 5,000 documents it returned about one result per query. Older databases get their full-text index rebuilt with stemming the first time they are opened.
 
-On BEIR SciFact (300 queries, MiniLM-L12 int8, chunks off) this took nDCG@10 from 0.646 to 0.723, Recall@5 from 0.714 to 0.808, Recall@10 from 0.798 to 0.869 and Recall@100 from 0.932 to 0.953. The keyword channel on its own went from 0.505 to 0.681 nDCG@10 (published BM25 is about 0.665).
+On BEIR SciFact (300 queries, MiniLM-L12 int8, chunks off; the 0.646 baseline is checked in under `BenchmarkResults/`, the hybrid run is not) this took nDCG@10 from 0.646 to 0.723, Recall@5 from 0.714 to 0.808, Recall@10 from 0.798 to 0.869 and Recall@100 from 0.932 to 0.953. The keyword channel on its own went from 0.505 to 0.681 nDCG@10 (published BM25 is about 0.665).
 
 ### DCS: Structured Context Routing
 
@@ -68,11 +68,13 @@ similarity = intent_jaccard × 0.5 + dcn_jaccard × 0.3 + domain_jaccard × 0.2
 
 ## Benchmark Results
 
-Retrieval accuracy is measured against [BEIR-SciFact](https://github.com/beir-cellar/beir) (scientific-claim verification) and an internal generated benchmark. Each query's relevant documents are known, so we report standard IR metrics at several cutoffs `k`.
+Retrieval accuracy is measured against [BEIR-SciFact](https://github.com/beir-cellar/beir) (scientific-claim verification). Each query's relevant documents are known, so we report standard IR metrics at several cutoffs `k`. There is also a small internal generated benchmark (26 knowledge entries); its queries are copies or near-copies of the indexed text, so it checks that the plumbing works, not how well retrieval generalises, and a perfect score on it says little.
 
-These results come from a compact **~33M-parameter** embedding model running locally on CPU — not a billion-parameter hosted retriever. Reaching near-perfect top-100 recall and ~97% top-5 recall at that size is what makes the approach practical to self-host.
+These results come from a compact **~33M-parameter** embedding model running locally on CPU — not a billion-parameter hosted retriever.
 
-**Latest & best run — `scifact-chunks-lsh` (BEIR-SciFact test, 2026-06-15):**
+**How far to trust the figures below.** The tuning loop (keep a change only if it helps) was run on the same 300 SciFact test queries the numbers are reported on, and there is no held-out set, so treat them as development-set numbers. Only the MiniLM SciFact run (nDCG@10 0.646, Recall@100 0.932) is checked in under [`BenchmarkResults/`](BenchmarkResults/); the runs below are not, so none of their numbers can be traced to raw output from this repository. The two tables use different models and settings and are not directly comparable.
+
+**Small run — `scifact-chunks-lsh` (BEIR-SciFact test, 2026-06-15, 30 queries; corpus size not recorded):**
 
 | Metric | @1 | @5 | @10 | @100 |
 |--------|----|----|-----|------|
@@ -80,9 +82,9 @@ These results come from a compact **~33M-parameter** embedding model running loc
 | **Precision** | 0.833 | 0.233 | 0.117 | 0.012 |
 | **nDCG** | 0.833 | 0.898 | 0.898 | 0.905 |
 
-**MRR 0.876** · **Candidate recall 1.000** · **Negative false-positive rate 0.000** · 30 queries · ~21 s
+**MRR 0.876** · **Candidate recall 1.000** · 30 queries · ~21 s
 
-This run retrieves the correct supporting document within the top 5 for **96.7%** of queries, and within the top 100 for **100%** — with zero false positives on negative cases. Chunk-level indexing with LSH (`htables=10`, `hfuncs=8`, 40-word chunks, 25% overlap) drove the largest gains over the unchunked baseline.
+This run retrieves the correct supporting document within the top 5 for **96.7%** of queries (29 of 30) and within the top 100 for all of them. With only 30 queries and an unrecorded corpus size, that is a smoke result, not a benchmark: the 300-query run below is the one to quote. A BEIR run has no negative cases (queries with no relevant document are skipped), so there is no false-positive rate to report. "Candidate recall" here is simply Recall at the search depth (`TopK`) of the final ranked list, which is why it equals Recall@100 in both tables. Chunk-level indexing with LSH (`htables=10`, `hfuncs=8`, 40-word chunks, 25% overlap) drove the largest gains over the unchunked baseline.
 
 **Full-scale run — `scifact-gte-int8-item2` (300 queries):**
 
@@ -91,9 +93,9 @@ This run retrieves the correct supporting document within the top 5 for **96.7%*
 | **Recall** | 0.583 | 0.746 | 0.806 | 0.930 |
 | **nDCG** | 0.610 | 0.684 | 0.705 | 0.733 |
 
-**MRR 0.682** · **Candidate recall 0.930** · 300 queries. At full corpus scale the system still surfaces the correct document in the top 100 for **93%** of queries.
+**MRR 0.682** · **Candidate recall 0.930** · 300 queries. At full corpus scale the system surfaces the correct document in the top 100 for **93%** of queries.
 
-Raw per-run JSON and a consolidated `retrieval.csv` summary live in [`BenchmarkResults/`](BenchmarkResults/). See [`BENCHMARKING_EXPLAINED.md`](BENCHMARKING_EXPLAINED.md) for metric definitions and how to reproduce.
+`BenchmarkResults/` holds the raw per-run JSON and a consolidated `retrieval.csv` for the runs that were saved there (the MiniLM SciFact run and runs of the internal generated set), not for every run quoted in this README. See [`BENCHMARKING_EXPLAINED.md`](BENCHMARKING_EXPLAINED.md) for metric definitions and how to reproduce.
 
 ---
 
@@ -345,7 +347,7 @@ All DCS and pipeline steps emit structured `Debug.WriteLine` output (filtered fr
 
 **Elective retrieval** — The calling AI decides what to retrieve based on summaries, not the retrieval system. If nothing is relevant it simply never sends a `retrieve` request.
 
-**Deterministic routing** — Context selection via structured identifiers is reproducible and debuggable. Threshold decisions can be traced in logs.
+**Traceable routing** — Context selection via structured identifiers is debuggable: threshold decisions can be traced in logs. It is not strictly reproducible: DCN recency decay uses the wall clock, and the DCS state (the nodes and message history) is whatever the caller feeds the assembler in that process; nothing is persisted, so a restart starts empty.
 
 **Temporal awareness** — DCN recency decay ensures stale topics lose influence automatically without manual cleanup.
 

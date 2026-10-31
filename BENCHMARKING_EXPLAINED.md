@@ -107,9 +107,11 @@ and score 1/rank (1st = 1.0, 2nd = 0.5, 3rd = 0.33...). Average over all queries
   exactly why the chat work switched to **nDCG@10** as the metric with headroom.
 
 ### Candidate Recall@100 — "did the right doc even make it into the room?"
-This is a **diagnostic** specific to how this system is built, and it's the most important
-one for debugging. Your pipeline has stages: a fast first stage gathers ~100 candidates,
-then later stages re-rank them. **Candidate Recall@100 = 83.4%** means the *first stage*
+This is a **diagnostic** specific to how this system is built. Note how it is measured in
+the code: it is Recall at the search depth (`TopK`) of the **final** ranked list, not a
+reading taken after the first stage alone, so when `TopK` is 100 it is the same number as
+Recall@100 (the README tables show exactly that). Your pipeline has stages: a fast first
+stage gathers ~100 candidates, then later stages re-rank them. **Candidate Recall@100 = 83.4%** means the *first stage*
 only managed to pull 83.4% of the relevant docs into the candidate pool at all — so
 **16.6% of relevant docs never even entered the pipeline**, and no amount of clever
 re-ranking downstream can recover them. They're gone before the smart stages run.
@@ -212,6 +214,15 @@ job: stopping a plausible-sounding idea that actually hurt.
 > the dense channel, so blending them equally **diluted** the good list with the bad one.
 > The open lever your notes flag — *weighted* fusion that down-weights the weak channel —
 > is the principled fix.
+>
+> **Update:** that experiment predates the current hybrid search. The README now describes
+> hybrid search as shipped: cosine plus a stemmed BM25 index, fused by RRF (nDCG@10 0.723 on
+> SciFact with MiniLM-L12). The keyword channel is much stronger now, which is the condition
+> under which RRF works. The numbers in §9 are from before that change, so the two documents
+> describe different points in time; the README has the current figures. Neither set has
+> been measured on held-out data: the "keep what helps, revert what doesn't" loop in this
+> section was run on the same 300 test queries the results are reported on, so read them as
+> development-set numbers.
 
 ---
 
@@ -285,7 +296,16 @@ Two practical notes from your setup:
   experiments. This is how you build a ledger of "what each change did" instead of
   one-off numbers you can't reproduce.
 
-> **The gate is the part most systems don't have.** It turns "we benchmarked once" into
+> **What the gate does and does not guard.** It runs `MeanRecall@5` on the small generated
+> set (26 entries), whose queries are copies or near-copies of the indexed text, with a
+> search depth that covers a large part of the corpus. A broken semantic channel would
+> still pass it. It also skips silently, without failing, when the model path or
+> `retrieval_baseline.json` is missing, so a CI run that does not provide them reports a
+> pass without checking anything. Treat it as a smoke test for the plumbing, not as a
+> quality gate; a real gate would use SciFact (or another external set) with a recorded
+> baseline.
+>
+> The idea is still the right one. It turns "we benchmarked once" into
 > "we *can't merge a regression*." That's the difference between a system that *was* good
 > once and a system that *stays* good. When someone brags about their RAG, "do you have a
 > gate that fails CI on a quality regression?" separates the engineered from the demoed.
