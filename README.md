@@ -70,7 +70,7 @@ similarity = intent_jaccard × 0.5 + dcn_jaccard × 0.3 + domain_jaccard × 0.2
 
 Retrieval accuracy is measured against [BEIR-SciFact](https://github.com/beir-cellar/beir) (scientific-claim verification). Each query's relevant documents are known, so we report standard IR metrics at several cutoffs `k`. There is also a small internal generated benchmark (26 knowledge entries); its queries are copies or near-copies of the indexed text, so it checks that the plumbing works, not how well retrieval generalises, and a perfect score on it says little.
 
-These results come from a compact **~33M-parameter** embedding model running locally on CPU — not a billion-parameter hosted retriever.
+The first two tables come from a compact **~33M-parameter** embedding model running locally on CPU. The GPU section after them uses a 300M-parameter model served by LM Studio.
 
 **How far to trust the figures below.** The tuning loop (keep a change only if it helps) was run on the same 300 SciFact test queries the numbers are reported on, and there is no held-out set, so treat them as development-set numbers. Only the MiniLM SciFact run (nDCG@10 0.646, Recall@100 0.932) is checked in under [`BenchmarkResults/`](BenchmarkResults/); the runs below are not, so none of their numbers can be traced to raw output from this repository. The two tables use different models and settings and are not directly comparable.
 
@@ -94,6 +94,50 @@ This run retrieves the correct supporting document within the top 5 for **96.7%*
 | **nDCG** | 0.610 | 0.684 | 0.705 | 0.733 |
 
 **MRR 0.682** · **Candidate recall 0.930** · 300 queries. At full corpus scale the system surfaces the correct document in the top 100 for **93%** of queries.
+
+### GPU embedding runs (embeddinggemma-300m via LM Studio, 2026-10-31)
+
+All runs below used the endpoint with `RemoteEmbeddingRequired` on, so the local model took no part. Model: `text-embedding-embeddinggemma-300m` (768 dimensions). Same caveat as above: SciFact was also the tuning set, and these raw outputs are not checked in.
+
+**BEIR-SciFact, 300 queries, 5,183 documents** (hybrid vector + keyword, exact cosine):
+
+| Configuration | nDCG@10 | Recall@10 | MRR | Recall@100 |
+|---|---|---|---|---|
+| Chunks off, no prompts | 0.7601 | 0.8887 | 0.7324 | 0.9717 |
+| Chunks on, no prompts | 0.7502 | 0.8583 | 0.7269 | 0.9733 |
+| **Chunks off, with embeddinggemma prompts (best)** | **0.7659** | 0.8886 | **0.7406** | **0.9817** |
+| Prompts + fuzzy matching always on | 0.7117 | 0.8323 | 0.6878 | 0.9683 |
+| Prompts + fuzzy + trigram candidate recall | 0.7094 | 0.8256 | 0.6874 | 0.9683 |
+| Prompts + MS MARCO MiniLM-L6 reranker | 0.7038 | 0.8462 | 0.6732 | 0.9817 |
+
+The best configuration is chunks off, the model's own query/document prompts, fuzzy matching off and no reranker. Those are the defaults except the prompts, which depend on the model and must be set:
+
+```
+DCS_EMBEDDING_QUERY_PREFIX    = task: search result | query: 
+DCS_EMBEDDING_DOCUMENT_PREFIX = title: none | text: 
+```
+
+Fuzzy matching and the web-search-trained reranker both hurt on scientific text, so they stay off. Chunking also lowered the score on this dataset (short abstracts). Other results with this model: retrieval benchmark MRR 0.9855; chat benchmark exact nDCG@10 0.7565 (local GTE-small: about 0.781).
+
+**LoCoMo** (turn level, adversarial questions excluded, 1,535 questions, no prompts): hybrid recall@5 0.600, recall@10 0.698, any-hit@10 0.769. By type, recall@10: single-hop 0.809, temporal 0.761, multi-hop 0.396, open-domain 0.389. Vector-only recall@10 was 0.642. LongMemEval-S was not re-run on the GPU path (a full run takes about 3 hours); an earlier partial run stopped at question 23 when the server went down.
+
+**Comparison with published results.** Figures come from public papers and leaderboards, quoted from memory and not re-checked, so treat them as approximate. Where the metric differs it says so.
+
+SciFact nDCG@10 (retrieval only):
+
+| System | nDCG@10 |
+|---|---|
+| BM25 (BEIR paper) | 0.665 |
+| gte-small, plain embeddings (MTEB) | 0.727 |
+| bge-large-en-v1.5 (MTEB) | ~0.74 |
+| Commercial embedding APIs (OpenAI text-embedding-3-large and similar) | ~0.74-0.79 |
+| embeddinggemma-300m, plain (independent run) | ~0.786 |
+| **DCS-EE-RAG, embeddinggemma-300m + prompts** | **0.766** |
+| BM25 + strong cross-encoder rerankers | ~0.78-0.80 |
+
+The pipeline scores 2 to 3 points below plain embeddings of the same model, so the hybrid layers cost something on this dataset.
+
+LoCoMo is not directly comparable: the public memory-system papers (Mem0, Zep, LangMem, OpenAI memory, full-context baselines) report answer accuracy judged by an LLM, about 53% to 75% depending on system and who ran it, while this repository reports retrieval recall of the evidence turns. Recall@10 of 0.70 means the evidence is in the retrieved context for roughly 70% of questions, which bounds answer accuracy from above but does not equal it. Multi-hop and open-domain questions are the weak spot at about 0.4. An end-to-end answer-accuracy run would be needed for a like-for-like comparison.
 
 `BenchmarkResults/` holds the raw per-run JSON and a consolidated `retrieval.csv` for the runs that were saved there (the MiniLM SciFact run and runs of the internal generated set), not for every run quoted in this README. See [`BENCHMARKING_EXPLAINED.md`](BENCHMARKING_EXPLAINED.md) for metric definitions and how to reproduce.
 
@@ -182,7 +226,7 @@ Or set `DCS_EMBEDDING_URL`, `DCS_EMBEDDING_MODEL` and `DCS_EMBEDDING_API_KEY` (o
 - Set `RemoteEmbeddingRequired` (or `DCS_EMBEDDING_REQUIRED=1`) for benchmarks: an endpoint that does not answer then throws instead of quietly using the local model, so a run cannot report the wrong model's numbers.
 - The vector size is read from the first reply, so any dimension works.
 - A database remembers which model made its vectors. Moving between the endpoint and the local model (or between two endpoint models) sets `EmbeddingModelMismatch` until `BackfillEmbeddingsAsync("all")` re-embeds everything.
-- Models that expect a query/document prefix (`nomic-embed-text`, `e5`) are not given one.
+- With no prefix set, nothing is added to the text (the default).
 
 ### Build
 
