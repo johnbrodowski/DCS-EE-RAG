@@ -1798,18 +1798,27 @@ END;
 
             FormatDataFields(data);
 
-            if (data.Embed && !string.IsNullOrEmpty(data.RequestID))
-            {
-                data = await EmbedResponse(data);
-            }
-
+            // Check first: a duplicate used to be embedded (the slow part) and then thrown away.
             if (!string.IsNullOrEmpty(data.RequestID) && await RequestIdExistsAsync(data.RequestID))
             {
                 Debug.WriteLine($"RequestID {data.RequestID} already exists. Skipping insertion.");
                 return;
             }
 
-            await InsertDataAndProcessLSH(data);
+            if (data.Embed && !string.IsNullOrEmpty(data.RequestID))
+            {
+                data = await EmbedResponse(data);
+            }
+
+            try
+            {
+                await InsertDataAndProcessLSH(data);
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == 19 && !string.IsNullOrEmpty(data.RequestID))
+            {
+                // Another caller inserted the same RequestID between the check and the insert (UNIQUE constraint).
+                Debug.WriteLine($"RequestID {data.RequestID} was inserted concurrently. Skipping insertion.");
+            }
         }
 
         private async Task InsertDataAndProcessLSH(FeedbackDatabaseValues data)

@@ -29,7 +29,7 @@ namespace LocalRAG
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _tokenizer = new BertTokenizer();
 
-            var sessionOptions = new SessionOptions
+            using var sessionOptions = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 InterOpNumThreads = _config.InterOpNumThreads,
@@ -47,6 +47,11 @@ namespace LocalRAG
             }
 
             _session = new InferenceSession(_config.ModelPath, sessionOptions);
+
+            // A failure from here on (a missing vocabulary file, say) would leave the native session open, because the
+            // constructor never returns an object to dispose.
+            try
+            {
 
             // Determine hidden dimension from model metadata
             _hiddenDim = GetHiddenDimensionFromModel();
@@ -74,6 +79,12 @@ namespace LocalRAG
                 Directory.CreateDirectory(_cacheDir);
                 var model = new FileInfo(_config.ModelPath);
                 _cacheSalt = $"v1|{model.Name}|{model.Length}|{_config.MaxSequenceLength}|{_config.RemoveStopWords}|{_config.LowercaseInput}";
+            }
+            }
+            catch
+            {
+                _session.Dispose();
+                throw;
             }
         }
 
