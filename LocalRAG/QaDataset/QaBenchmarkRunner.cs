@@ -4,7 +4,9 @@ namespace LocalRAG.QaDataset
 {
     /// <summary>
     /// Runs QA benchmark questions through the calling AI (askModel) and evaluates answers
-    /// against the correct/incorrect prediction lists in the dataset.
+    /// against the correct/incorrect prediction lists in the dataset. <c>askModel</c> must answer every
+    /// prompt in a fresh conversation: the runner sends no history, so a session that remembers earlier
+    /// questions makes the reported percentages depend on question order.
     /// </summary>
     public static class QaBenchmarkRunner
     {
@@ -59,6 +61,9 @@ namespace LocalRAG.QaDataset
 
                 try
                 {
+                    // askModel is the calling AI. Each question is independent: askModel must not carry
+                    // conversation history from one question into the next, or accuracy depends on question
+                    // order and a long run overflows the model's context part-way (G4-1).
                     var prompt = BuildPrompt(item, allEmbeddings, itemLookup, opts);
                     var reply = await askModel(prompt);
                     modelResponse = reply ?? "";
