@@ -75,11 +75,19 @@ public class ModelComparisonTests
                 entries.Add(("remote:" + model, new RAGConfiguration { RemoteEmbeddingUrl = remoteUrl, RemoteEmbeddingModel = model, RemoteEmbeddingProbeTimeoutMs = 120000 }));
         }
 
-        foreach (var (label, cfg) in entries)
+        // Every model runs at the same time (set SWEEP_SEQUENTIAL=1 for one at a time). ms/embed then includes the
+        // contention between them, so compare scores across models and treat the times as a rough guide.
+        async Task<string> RunModel(string label, RAGConfiguration cfg)
+        {
+            try { return await RunModelCore(label, cfg); }
+            catch (Exception ex) { return $"{label}: FAILED {ex.GetType().Name}: {ex.Message}"; }
+        }
+
+        async Task<string> RunModelCore(string label, RAGConfiguration cfg)
         {
             using var embedder = new EmbedderClassNew(cfg);
             if (cfg.RemoteEmbeddingUrl != null && !embedder.ModelFingerprint.StartsWith("remote|"))
-            { _output.WriteLine($"{label}: endpoint did not answer"); continue; }
+                return $"{label}: endpoint did not answer";
             await embedder.GetEmbeddingsAsync(queryText[qids[0]]); // warm up
 
             var sw = Stopwatch.StartNew();
@@ -106,10 +114,29 @@ public class ModelComparisonTests
             }
             int m = qids.Count;
             int dim = qVecs[qids[0]].Length;
-            _output.WriteLine(
-                $"{label,-34} {dim,4} {sw.Elapsed.TotalMilliseconds / embeds,9:F1} " +
-                $"{ndcg / m,8:F4} {recall / m,10:F4} {mrr / m,6:F4}");
+            return $"{label,-34} {dim,4} {sw.Elapsed.TotalMilliseconds / embeds,9:F1} " +
+                   $"{ndcg / m,8:F4} {recall / m,10:F4} {mrr / m,6:F4}";
         }
+
+        // A model loaded on demand makes the server fail other requests while it loads, so load them one at a time first.
+        foreach (var (label, cfg) in entries.Where(e => e.Cfg.RemoteEmbeddingUrl != null))
+        {
+            using var warm = new RemoteEmbeddingClient(cfg);
+            for (int attempt = 0; attempt < 3 && !await warm.ProbeAsync(180000); attempt++)
+                _output.WriteLine($"{label}: load attempt {attempt + 1} failed");
+        }
+
+        var lines = Environment.GetEnvironmentVariable("SWEEP_SEQUENTIAL") == "1"
+            ? await SequentialAsync(entries, RunModel)
+            : await Task.WhenAll(entries.Select(e => Task.Run(() => RunModel(e.Label, e.Cfg))));
+        foreach (var line in lines) _output.WriteLine(line);
+    }
+
+    private static async Task<string[]> SequentialAsync(List<(string Label, RAGConfiguration Cfg)> entries, Func<string, RAGConfiguration, Task<string>> run)
+    {
+        var lines = new List<string>();
+        foreach (var (label, cfg) in entries) lines.Add(await run(label, cfg));
+        return lines.ToArray();
     }
 
     // ── helpers ──
