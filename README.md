@@ -291,6 +291,14 @@ public class RAGConfiguration
 }
 ```
 
+### Database safety
+
+- **Schema.** The database carries `PRAGMA user_version`. Opening an older file adds the columns it lacks; a file from a newer version is refused.
+- **Embedding model.** The database remembers which model and vector-changing settings made its embeddings. If you load a different model, `EmbeddingModelMismatch` is set and searching, embedding new text and `BackfillEmbeddingsAsync("missing")` throw until `BackfillEmbeddingsAsync("all")` has re-embedded every record. A cancelled or partly failed full re-embed leaves the flag set.
+- **Failures are reported, not hidden.** A row stored without some of its embeddings (failure or the 30 s wait) is counted in `EmbeddingFailures` and raised through `EmbeddingFailed`. A corrupt stored embedding is skipped at start-up and counted in `WarmUpSkippedRecords`. The RAG audit writes return whether a row was updated, and `search` / `retrieve` results carry `auditRecorded`.
+- **Shutdown.** `EmbeddingDatabaseNew` is `IAsyncDisposable`; disposing cancels queued updates (their callers get `OperationCanceledException`) and later updates throw `ObjectDisposedException`.
+- **Retrieved text.** Candidate summaries are flattened to one line (300 characters at most) and full entries are quoted line by line, so stored text cannot forge `[ID:n]`, `---`, `Entry n:` or `NOTE:` lines. A `RETRIEVE` command must be the first line of the reply.
+
 ### DCS Thresholds (in `DcsContextAssembler`)
 
 | Constant | Default | Meaning |
