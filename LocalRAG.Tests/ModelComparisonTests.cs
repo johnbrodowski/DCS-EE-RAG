@@ -29,7 +29,11 @@ public class ModelComparisonTests
         Skip.If(string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir), "Set BEIR_SCIFACT_DIR.");
 
         var pathsEnv = Environment.GetEnvironmentVariable("MODEL_PATHS");
-        Skip.If(string.IsNullOrWhiteSpace(pathsEnv), "Set MODEL_PATHS (semicolon-separated model.onnx paths).");
+        // REMOTE_EMBEDDING_URL (an OpenAI-compatible base URL, e.g. http://host:1234/v1) adds every embedding model the
+        // server lists, or the ones named in REMOTE_MODELS (semicolon-separated).
+        var remoteUrl = Environment.GetEnvironmentVariable("REMOTE_EMBEDDING_URL");
+        Skip.If(string.IsNullOrWhiteSpace(pathsEnv) && string.IsNullOrWhiteSpace(remoteUrl),
+            "Set MODEL_PATHS (semicolon-separated model.onnx paths) and/or REMOTE_EMBEDDING_URL.");
 
         int nQueries = int.TryParse(Environment.GetEnvironmentVariable("SWEEP_QUERIES"), out var q) ? q : 30;
         int poolSize = int.TryParse(Environment.GetEnvironmentVariable("SWEEP_POOL"), out var p) ? p : 150;
@@ -52,15 +56,30 @@ public class ModelComparisonTests
             if (!relevant.Contains(id)) pool.Add(id);
         }
         _output.WriteLine($"Eval set: {qids.Count} queries, {pool.Count} docs (exact cosine, no LSH/chunks).");
-        _output.WriteLine($"{"model",-22} {"dim",4} {"ms/embed",9} {"nDCG@10",8} {"Recall@10",10} {"MRR",6}");
+        _output.WriteLine($"{"model",-34} {"dim",4} {"ms/embed",9} {"nDCG@10",8} {"Recall@10",10} {"MRR",6}");
 
-        foreach (var modelPath in pathsEnv!.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        var entries = new List<(string Label, RAGConfiguration Cfg)>();
+        foreach (var modelPath in (pathsEnv ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             if (!File.Exists(modelPath)) { _output.WriteLine($"{Path.GetFileName(modelPath)}: MISSING"); continue; }
             var vocab = Path.Combine(Path.GetDirectoryName(modelPath)!, "vocab.txt");
-            var cfg = new RAGConfiguration { ModelPath = modelPath, VocabularyPath = vocab };
+            entries.Add((Path.GetFileName(modelPath), new RAGConfiguration { ModelPath = modelPath, VocabularyPath = vocab, RemoteEmbeddingUrl = null }));
+        }
+        if (!string.IsNullOrWhiteSpace(remoteUrl))
+        {
+            var named = Environment.GetEnvironmentVariable("REMOTE_MODELS");
+            var remoteModels = string.IsNullOrWhiteSpace(named)
+                ? await RemoteEmbeddingClient.ListEmbeddingModelsAsync(remoteUrl!, Environment.GetEnvironmentVariable("DCS_EMBEDDING_API_KEY"))
+                : named.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+            foreach (var model in remoteModels)
+                entries.Add(("remote:" + model, new RAGConfiguration { RemoteEmbeddingUrl = remoteUrl, RemoteEmbeddingModel = model, RemoteEmbeddingProbeTimeoutMs = 120000 }));
+        }
 
+        foreach (var (label, cfg) in entries)
+        {
             using var embedder = new EmbedderClassNew(cfg);
+            if (cfg.RemoteEmbeddingUrl != null && !embedder.ModelFingerprint.StartsWith("remote|"))
+            { _output.WriteLine($"{label}: endpoint did not answer"); continue; }
             await embedder.GetEmbeddingsAsync(queryText[qids[0]]); // warm up
 
             var sw = Stopwatch.StartNew();
@@ -88,7 +107,7 @@ public class ModelComparisonTests
             int m = qids.Count;
             int dim = qVecs[qids[0]].Length;
             _output.WriteLine(
-                $"{Path.GetFileName(modelPath),-22} {dim,4} {sw.Elapsed.TotalMilliseconds / embeds,9:F1} " +
+                $"{label,-34} {dim,4} {sw.Elapsed.TotalMilliseconds / embeds,9:F1} " +
                 $"{ndcg / m,8:F4} {recall / m,10:F4} {mrr / m,6:F4}");
         }
     }

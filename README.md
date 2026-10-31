@@ -169,13 +169,15 @@ Embeddings can come from an OpenAI-compatible endpoint instead of the local ONNX
 var config = new RAGConfiguration
 {
     RemoteEmbeddingUrl   = "http://gpu-box:1234/v1",
-    RemoteEmbeddingModel = "emb"      // the model identifier LM Studio serves
+    RemoteEmbeddingModel = "text-embedding-gte-large"   // the id LM Studio shows; null or "auto" picks the first embedding model it lists
 };
 ```
 
-Or set `DCS_EMBEDDING_URL`, `DCS_EMBEDDING_MODEL` (default `emb`) and `DCS_EMBEDDING_API_KEY` (only if the endpoint needs one).
+Or set `DCS_EMBEDDING_URL`, `DCS_EMBEDDING_MODEL` and `DCS_EMBEDDING_API_KEY` (only if the endpoint needs one).
 
 - The endpoint is tried once when the embedder is created (`RemoteEmbeddingProbeTimeoutMs`, 3 s). If it answers, it makes every vector and the local model is not loaded. If it does not, the local ONNX model is used. The choice is not revisited mid-run, so one run never mixes two models.
+- `RemoteEmbeddingClient.ListEmbeddingModelsAsync(url, apiKey)` lists the embedding models the server has loaded. LM Studio with authentication on needs the token in `DCS_EMBEDDING_API_KEY`.
+- To compare every loaded embedding model on a small BEIR SciFact set (nDCG@10, Recall@10, MRR, ms per embed): set `BEIR_SCIFACT_DIR`, `REMOTE_EMBEDDING_URL` (and `DCS_EMBEDDING_API_KEY`), optionally `REMOTE_MODELS` (semicolon-separated ids), then `dotnet test LocalRAG.Tests -c Release --filter Category=ModelSweep`.
 - The vector size is read from the first reply, so any dimension works.
 - A database remembers which model made its vectors. Moving between the endpoint and the local model (or between two endpoint models) sets `EmbeddingModelMismatch` until `BackfillEmbeddingsAsync("all")` re-embeds everything.
 - Models that expect a query/document prefix (`nomic-embed-text`, `e5`) are not given one.
@@ -287,7 +289,7 @@ public class RAGConfiguration
 
     // Remote embeddings (optional; see "Embeddings on a GPU machine")
     string? RemoteEmbeddingUrl            // OpenAI-compatible base URL; null = local model (env DCS_EMBEDDING_URL)
-    string  RemoteEmbeddingModel          // Model id sent to the endpoint (default: "emb")
+    string? RemoteEmbeddingModel         // Model id sent to the endpoint; null/"auto" = first embedding model listed
     string? RemoteEmbeddingApiKey         // Bearer token, if needed
     int     RemoteEmbeddingProbeTimeoutMs // Start-up check before falling back (default: 3000)
     int     RemoteEmbeddingTimeoutSeconds // Per-request timeout (default: 60)

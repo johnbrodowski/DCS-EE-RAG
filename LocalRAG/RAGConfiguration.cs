@@ -62,8 +62,8 @@ namespace LocalRAG
         /// the database model check.
         /// </summary>
         public string? RemoteEmbeddingUrl { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_URL");
-        /// <summary>Model identifier sent to the endpoint.</summary>
-        public string RemoteEmbeddingModel { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_MODEL") ?? "emb";
+        /// <summary>Model identifier sent to the endpoint. Null, empty or "auto" picks the first embedding model the server lists.</summary>
+        public string? RemoteEmbeddingModel { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_MODEL");
         /// <summary>Bearer token for the endpoint, if it needs one (LM Studio does not).</summary>
         public string? RemoteEmbeddingApiKey { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_API_KEY");
         /// <summary>How long the start-up check waits before the local model is used instead.</summary>
