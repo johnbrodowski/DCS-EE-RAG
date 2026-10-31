@@ -68,6 +68,12 @@ namespace LocalRAG
         public string? RemoteEmbeddingApiKey { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_API_KEY");
         /// <summary>How long the start-up check waits before the local model is used instead.</summary>
         public int RemoteEmbeddingProbeTimeoutMs { get; set; } = 3000;
+        /// <summary>
+        /// When true, an endpoint that does not answer is an error and the local model is never used (env DCS_EMBEDDING_REQUIRED=1).
+        /// Use it for benchmarks, so a run cannot quietly report the local model's numbers. The start-up check then waits
+        /// at least two minutes, because a model the server loads on demand can take that long to come up.
+        /// </summary>
+        public bool RemoteEmbeddingRequired { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_REQUIRED") is "1" or "true";
         /// <summary>Timeout of each embedding request once the endpoint is in use.</summary>
         public int RemoteEmbeddingTimeoutSeconds { get; set; } = 60;
 

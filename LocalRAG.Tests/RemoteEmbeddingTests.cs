@@ -88,6 +88,16 @@ public class RemoteEmbeddingTests
     }
 
     [Fact]
+    public void SilentEndpoint_WhenRequired_ThrowsInsteadOfFallingBack()
+    {
+        var cfg = Config("http://127.0.0.1:1/v1");
+        cfg.RemoteEmbeddingRequired = true;
+        // The local model files do not exist, so a fallback would throw a file error, not this message.
+        var ex = Assert.Throws<InvalidOperationException>(() => new EmbedderClassNew(cfg));
+        Assert.Contains("RemoteEmbeddingRequired", ex.Message);
+    }
+
+    [Fact]
     public void NoUrl_NeverContactsAnything()
         => Assert.ThrowsAny<Exception>(() => new EmbedderClassNew(Config(null)));
 }

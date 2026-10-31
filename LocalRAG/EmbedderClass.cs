@@ -34,11 +34,14 @@ namespace LocalRAG
             if (!string.IsNullOrWhiteSpace(_config.RemoteEmbeddingUrl))
             {
                 var client = new RemoteEmbeddingClient(_config);
-                if (client.ProbeAsync(_config.RemoteEmbeddingProbeTimeoutMs).GetAwaiter().GetResult())
+                var probeMs = _config.RemoteEmbeddingRequired ? Math.Max(_config.RemoteEmbeddingProbeTimeoutMs, 120000) : _config.RemoteEmbeddingProbeTimeoutMs;
+                if (client.ProbeAsync(probeMs).GetAwaiter().GetResult())
                     _remote = client;
                 else
                 {
                     client.Dispose();
+                    if (_config.RemoteEmbeddingRequired)
+                        throw new InvalidOperationException($"The embedding endpoint {_config.RemoteEmbeddingUrl} did not answer and RemoteEmbeddingRequired is set, so the local model is not used.");
                     Debug.WriteLine($"Embedding endpoint {_config.RemoteEmbeddingUrl} did not answer; using the local model.");
                 }
             }

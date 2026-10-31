@@ -178,6 +178,7 @@ Or set `DCS_EMBEDDING_URL`, `DCS_EMBEDDING_MODEL` and `DCS_EMBEDDING_API_KEY` (o
 - The endpoint is tried once when the embedder is created (`RemoteEmbeddingProbeTimeoutMs`, 3 s). If it answers, it makes every vector and the local model is not loaded. If it does not, the local ONNX model is used. The choice is not revisited mid-run, so one run never mixes two models.
 - `RemoteEmbeddingClient.ListEmbeddingModelsAsync(url, apiKey)` lists the embedding models the server has loaded. LM Studio with authentication on needs the token in `DCS_EMBEDDING_API_KEY`.
 - To compare every loaded embedding model on a small BEIR SciFact set (nDCG@10, Recall@10, MRR, ms per embed): set `BEIR_SCIFACT_DIR`, `REMOTE_EMBEDDING_URL` (and `DCS_EMBEDDING_API_KEY`), optionally `REMOTE_MODELS` (semicolon-separated ids), then `dotnet test LocalRAG.Tests -c Release --filter Category=ModelSweep`.
+- Set `RemoteEmbeddingRequired` (or `DCS_EMBEDDING_REQUIRED=1`) for benchmarks: an endpoint that does not answer then throws instead of quietly using the local model, so a run cannot report the wrong model's numbers.
 - The vector size is read from the first reply, so any dimension works.
 - A database remembers which model made its vectors. Moving between the endpoint and the local model (or between two endpoint models) sets `EmbeddingModelMismatch` until `BackfillEmbeddingsAsync("all")` re-embeds everything.
 - Models that expect a query/document prefix (`nomic-embed-text`, `e5`) are not given one.
@@ -292,6 +293,7 @@ public class RAGConfiguration
     string? RemoteEmbeddingModel         // Model id sent to the endpoint; null/"auto" = first embedding model listed
     string? RemoteEmbeddingApiKey         // Bearer token, if needed
     int     RemoteEmbeddingProbeTimeoutMs // Start-up check before falling back (default: 3000)
+    bool    RemoteEmbeddingRequired       // True = never fall back to the local model; throw instead (env DCS_EMBEDDING_REQUIRED=1)
     int     RemoteEmbeddingTimeoutSeconds // Per-request timeout (default: 60)
 
     // Chunking
