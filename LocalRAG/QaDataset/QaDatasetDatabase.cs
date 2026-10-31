@@ -69,6 +69,11 @@ namespace LocalRAG.QaDataset
 
         // ── Import ────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Adds one item and returns its Id, or 0 when the same question from the same dataset source is already there
+        /// (a re-import, or a file with a repeated line, must not create a second copy that would sit in the prompt of
+        /// its own twin as a worked example).
+        /// </summary>
         public async Task<int> ImportItemAsync(QaDatasetItem item)
         {
             await _writeLock.WaitAsync();
@@ -81,8 +86,9 @@ namespace LocalRAG.QaDataset
                     INSERT INTO qa_items
                         (Question, Answers, DefCorrectPredictions, PossCorrectPredictions,
                          DefIncorrectPredictions, AnswerAndDefCorrectPredictions, DatasetSource)
-                    VALUES (@q, @ans, @def, @poss, @defInc, @andDef, @src);
-                    SELECT last_insert_rowid();";
+                    SELECT @q, @ans, @def, @poss, @defInc, @andDef, @src
+                    WHERE NOT EXISTS (SELECT 1 FROM qa_items WHERE Question = @q AND DatasetSource IS @src);
+                    SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END;";
 
                 await using var cmd = new SqliteCommand(sql, conn);
                 cmd.Parameters.AddWithValue("@q", item.Question);
@@ -141,13 +147,15 @@ namespace LocalRAG.QaDataset
             }
         }
 
-        public async Task<List<QaDatasetItem>> GetUnembeddedItemsAsync(int batchSize = 50)
+        public async Task<List<QaDatasetItem>> GetUnembeddedItemsAsync(int batchSize = 50, IReadOnlyCollection<int>? excludeIds = null)
         {
             await using var conn = OpenConnection();
             await conn.OpenAsync();
 
+            // Ids are integers, so listing them in the statement cannot inject anything.
+            var exclude = excludeIds is { Count: > 0 } ? $"AND Id NOT IN ({string.Join(",", excludeIds)}) " : "";
             await using var cmd = new SqliteCommand(
-                "SELECT Id, Question FROM qa_items WHERE IsEmbedded = 0 LIMIT @limit",
+                $"SELECT Id, Question FROM qa_items WHERE IsEmbedded = 0 {exclude}LIMIT @limit",
                 conn);
             cmd.Parameters.AddWithValue("@limit", batchSize);
 
@@ -183,9 +191,10 @@ namespace LocalRAG.QaDataset
 
         /// <summary>
         /// Returns up to <paramref name="count"/> items in random order.
-        /// When <paramref name="onlyEmbedded"/> is true only items with embeddings are returned.
+        /// When <paramref name="onlyEmbedded"/> is true only items with embeddings are returned. With a
+        /// <paramref name="seed"/> the same sample comes back every time; without one it is random.
         /// </summary>
-        public async Task<List<QaDatasetItem>> GetItemsForRunAsync(int count, bool onlyEmbedded = true)
+        public async Task<List<QaDatasetItem>> GetItemsForRunAsync(int count, bool onlyEmbedded = true, int? seed = null)
         {
             await using var conn = OpenConnection();
             await conn.OpenAsync();
@@ -194,10 +203,12 @@ namespace LocalRAG.QaDataset
             var sql = $@"
                 SELECT Id, Question, Answers, DefCorrectPredictions, PossCorrectPredictions,
                        DefIncorrectPredictions, AnswerAndDefCorrectPredictions, QuestionEmbedding, IsEmbedded
-                FROM qa_items {where} ORDER BY RANDOM() LIMIT @count";
+                FROM qa_items {where} ORDER BY {(seed.HasValue ? "((Id * @mult) % 2147483647)" : "RANDOM()")} LIMIT @count";
 
             await using var cmd = new SqliteCommand(sql, conn);
             cmd.Parameters.AddWithValue("@count", count);
+            // Id * multiplier mod a prime scatters the ids; a different seed gives a different multiplier, so a different order.
+            if (seed.HasValue) cmd.Parameters.AddWithValue("@mult", (Math.Abs((long)seed.Value) * 2654435761L) % 2147483629L + 1);
 
             var items = new List<QaDatasetItem>();
             await using var reader = await cmd.ExecuteReaderAsync();

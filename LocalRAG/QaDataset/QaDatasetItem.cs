@@ -60,6 +60,12 @@ namespace LocalRAG.QaDataset
     public class QaBenchmarkOptions
     {
         public int MaxQuestions { get; set; } = 50;
+        /// <summary>
+        /// Fixes which questions are drawn. Leave null for a random sample. Runs that are compared with each other
+        /// (a sweep over models or temperatures) must share one seed, or each is scored on different questions and a
+        /// difference may be only the luck of the draw.
+        /// </summary>
+        public int? Seed { get; set; }
         public string Provider { get; set; } = "Anthropic";
         public string Model { get; set; } = "claude-haiku-4-5-20251001";
         public int MaxTokens { get; set; } = 256;

@@ -45,20 +45,24 @@ namespace LocalRAG.QaDataset
             CancellationToken ct = default)
         {
             var source = Path.GetFileName(filePath);
-            int count = 0;
+            int count = 0, skipped = 0;
 
-            foreach (var item in ParseJsonl(filePath))
+            // A bad line mid-file must fail before any row is written; otherwise a retry duplicates what went in.
+            var items = ParseJsonl(filePath).ToList();
+
+            foreach (var item in items)
             {
                 ct.ThrowIfCancellationRequested();
                 item.DatasetSource = source;
-                await db.ImportItemAsync(item);
-                count++;
+                if (await db.ImportItemAsync(item) == 0) skipped++;
+                else count++;
 
-                if (count % 500 == 0)
+                if ((count + skipped) % 500 == 0)
                     progress?.Report($"Imported {count:N0} items…");
             }
 
-            progress?.Report($"Import complete — {count:N0} items loaded from {source}.");
+            progress?.Report($"Import complete — {count:N0} items loaded from {source}" +
+                             (skipped > 0 ? $", {skipped:N0} duplicate(s) skipped." : "."));
             return count;
         }
     }

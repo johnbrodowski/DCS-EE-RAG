@@ -22,11 +22,11 @@ namespace LocalRAG.QaDataset
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             // Prefer embedded items; fall back to unembedded if needed to reach MaxQuestions
-            var items = await db.GetItemsForRunAsync(opts.MaxQuestions, onlyEmbedded: true);
+            var items = await db.GetItemsForRunAsync(opts.MaxQuestions, onlyEmbedded: true, opts.Seed);
             if (items.Count < opts.MaxQuestions)
             {
                 var deficit = opts.MaxQuestions - items.Count;
-                var extras = await db.GetItemsForRunAsync(deficit, onlyEmbedded: false);
+                var extras = await db.GetItemsForRunAsync(deficit, onlyEmbedded: false, opts.Seed);
                 var existingIds = new HashSet<int>(items.Select(x => x.Id));
                 items.AddRange(extras.Where(x => !existingIds.Contains(x.Id)));
             }
@@ -184,9 +184,12 @@ namespace LocalRAG.QaDataset
             if (opts.UseRagContext && allEmbeddings != null && item.QuestionEmbedding != null)
             {
                 var similarIds = FindSimilarIds(item.QuestionEmbedding, allEmbeddings, item.Id, opts.SimilarContextCount);
+                // A copy of this very question (a re-import, a repeated line) carries its answer; it is not an example.
+                var own = NormalizeQuestion(item.Question);
                 var contextItems = similarIds
                     .Where(id => itemLookup.ContainsKey(id))
                     .Select(id => itemLookup[id])
+                    .Where(c => NormalizeQuestion(c.Question) != own)
                     .ToList();
 
                 if (contextItems.Count > 0)
@@ -206,6 +209,9 @@ namespace LocalRAG.QaDataset
             return sb.ToString();
         }
 
+        private static string NormalizeQuestion(string q) =>
+            System.Text.RegularExpressions.Regex.Replace(q.ToLowerInvariant(), @"[\W_]+", " ").Trim();
+
         private static List<int> FindSimilarIds(
             float[] query,
             List<(int Id, float[] Embedding)> all,
@@ -224,9 +230,13 @@ namespace LocalRAG.QaDataset
         // Both vectors are L2-normalized, so dot product equals cosine similarity.
         private static float DotProduct(float[] a, float[] b)
         {
-            var len = Math.Min(a.Length, b.Length);
+            // Different lengths mean the vectors came from different embedding models; a truncated dot product would rank
+            // the "similar examples" arbitrarily, so refuse (re-run the embedding backfill with overwrite) (G4-12).
+            if (a.Length != b.Length)
+                throw new InvalidOperationException(
+                    $"Question embeddings have different sizes ({a.Length} and {b.Length}): they were made by different models. Re-embed the dataset.");
             float dot = 0f;
-            for (int i = 0; i < len; i++) dot += a[i] * b[i];
+            for (int i = 0; i < a.Length; i++) dot += a[i] * b[i];
             return dot;
         }
     }

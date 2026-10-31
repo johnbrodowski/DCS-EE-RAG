@@ -33,7 +33,7 @@ namespace LocalRAG.QaDataset
                     if (overwriteExisting)
                         await db.ResetAllEmbeddingsAsync();
 
-                    await RunAsync(db, embedder, progress, ct);
+                    await RunAsync(db, embedder, progress, onError, ct);
                 }
                 catch (OperationCanceledException) { /* expected on Stop() */ }
                 catch (Exception ex) { onError?.Invoke(ex.Message); }
@@ -50,15 +50,20 @@ namespace LocalRAG.QaDataset
             QaDatasetDatabase db,
             EmbedderClassNew embedder,
             IProgress<(int Done, int Total)>? progress,
+            Action<string>? onError,
             CancellationToken ct)
         {
             var (total, embedded) = await db.GetItemCountAsync();
             int done = embedded;
             progress?.Report((done, total));
 
+            // Items that could not be embedded (blank text, a model error) stay unembedded in the database; without this
+            // set the same rows came back every pass and the loop never ended or said why.
+            var failed = new HashSet<int>();
+
             while (!ct.IsCancellationRequested)
             {
-                var batch = await db.GetUnembeddedItemsAsync(50);
+                var batch = await db.GetUnembeddedItemsAsync(50, failed);
                 if (batch.Count == 0) break;  // all done
 
                 foreach (var item in batch)
@@ -71,6 +76,10 @@ namespace LocalRAG.QaDataset
                         await db.UpdateEmbeddingAsync(item.Id, embedding);
                         done++;
                         progress?.Report((done, total));
+                    }
+                    else if (failed.Add(item.Id))
+                    {
+                        onError?.Invoke($"Question {item.Id} could not be embedded and was skipped.");
                     }
                 }
             }
