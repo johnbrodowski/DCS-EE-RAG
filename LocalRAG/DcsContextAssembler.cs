@@ -20,10 +20,17 @@ namespace LocalRAG
         public const double ELIGIBILITY_THRESHOLD = 0.1;
 
         private readonly Dictionary<int, DcnNode> _dcnStore = new();
-        private readonly Dictionary<int, List<string>> _identifierIndex = new();
+        private readonly Dictionary<(int Level, int Id), List<string>> _identifierIndex = new();
+        private readonly Func<DateTime> _clock;
         private readonly Dictionary<string, DcsMessageRecord> _messageStore = new();
         private readonly List<DcsLogEntry> _log = [];
         private int _nextDcnId = 1;
+
+        /// <param name="clock">
+        /// UTC "now" used for recency decay. Pass a fixed clock to replay the same state and get the same ranking;
+        /// the default is the system clock (C1 #9).
+        /// </param>
+        public DcsContextAssembler(Func<DateTime>? clock = null) => _clock = clock ?? (() => DateTime.UtcNow);
 
         /// <summary>Read-only access to the selection log for diagnostics.</summary>
         public IReadOnlyList<DcsLogEntry> Log => _log.AsReadOnly();
@@ -60,10 +67,10 @@ namespace LocalRAG
             {
                 if (_dcnStore.TryGetValue(dcnId, out var dcn))
                 {
-                    dcn.TouchReference();
+                    dcn.TouchReference(_clock());
                     if (!dcn.LinkedMessageIds.Contains(msg.MessageId))
                         dcn.LinkedMessageIds.Add(msg.MessageId);
-                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Register >   Linked to DCN {dcnId} (recency={dcn.ComputeRecencyWeight():F3}, now {dcn.LinkedMessageIds.Count} messages)");
+                    Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Register >   Linked to DCN {dcnId} (recency={dcn.ComputeRecencyWeight(_clock()):F3}, now {dcn.LinkedMessageIds.Count} messages)");
                 }
                 else
                 {
@@ -130,7 +137,7 @@ namespace LocalRAG
                     if (_dcnStore.TryGetValue(dcnId, out var dcn))
                     {
                         hasDcn = true;
-                        decayMultiplier = Math.Max(decayMultiplier, dcn.ComputeRecencyWeight());
+                        decayMultiplier = Math.Max(decayMultiplier, dcn.ComputeRecencyWeight(_clock()));
                     }
                 }
                 if (!hasDcn) decayMultiplier = 1.0;
@@ -203,15 +210,18 @@ namespace LocalRAG
 
             if (bestMatch != null)
             {
-                bestMatch.TouchReference();
+                bestMatch.TouchReference(_clock());
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > Matched existing DCN {bestMatch.DcnId} (score={bestScore:F3})");
                 return bestMatch;
             }
 
             // Create new DCN
+            var now = _clock();
             var newDcn = new DcnNode
             {
                 DcnId = _nextDcnId++,
+                CreatedUtc = now,
+                LastReferencedUtc = now,
                 TopicIdentifiers = key.IntentIds.Concat(key.DomainIds).Distinct().ToArray()
             };
 
@@ -244,7 +254,7 @@ namespace LocalRAG
                 var dcnTopics = new HashSet<int>(dcn.TopicIdentifiers);
                 var msgTopics = new HashSet<int>(key.IntentIds.Concat(key.DomainIds).Distinct());
                 var similarity = DcsKey.Jaccard(dcnTopics.ToArray(), msgTopics.ToArray());
-                var recency = dcn.ComputeRecencyWeight();
+                var recency = dcn.ComputeRecencyWeight(_clock());
                 var score = similarity * recency;
 
                 Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN >   DCN {dcn.DcnId}: similarity={similarity:F3} x recency={recency:F3} -> score={score:F3}{(score > bestScore && score >= ELIGIBILITY_THRESHOLD ? " <- best" : "")}");

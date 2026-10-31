@@ -23,6 +23,14 @@ namespace LocalRAG
         {
             double intentScore = Jaccard(IntentIds, other.IntentIds);
             double domainScore = Jaccard(DomainIds, other.DomainIds);
+
+            // The DCN term is continuity evidence only when both keys name a DCN. Two empty sets are "nothing
+            // known", not "the same thread" (Jaccard calls them identical), and a key with a DCN against one
+            // without says nothing either way. Then the term is left out and the other weights are rescaled,
+            // so classifier keys (which never carry a DCN) cannot score 0.3 for free (C1 #8).
+            if (DcnIds.Length == 0 || other.DcnIds.Length == 0)
+                return ((intentScore * 0.5) + (domainScore * 0.2)) / 0.7;
+
             double dcnScore = Jaccard(DcnIds, other.DcnIds);
 
             return (intentScore * 0.5) +
@@ -48,13 +56,21 @@ namespace LocalRAG
             return union == 0 ? 0.0 : (double)intersection / union;
         }
 
+        public const int IntentLevel = 0;
+        public const int DomainLevel = 1;
+        public const int DcnLevel = 2;
+
         /// <summary>
-        /// Returns all identifier values for index lookups.
-        /// Used by the identifier index to map IDs → message references.
+        /// Returns all identifiers for index lookups, each tagged with its level. Intent, domain and DCN ids all
+        /// start at 1, so a bare number would pull in unrelated messages (query intent 1 matching domain 1) (C1 #8).
+        /// Used by the identifier index to map (level, id) → message references.
         /// </summary>
-        public int[] AllIdentifiers()
+        public (int Level, int Id)[] AllIdentifiers()
         {
-            return IntentIds.Concat(DomainIds).Concat(DcnIds).ToArray();
+            return IntentIds.Select(i => (IntentLevel, i))
+                .Concat(DomainIds.Select(i => (DomainLevel, i)))
+                .Concat(DcnIds.Select(i => (DcnLevel, i)))
+                .ToArray();
         }
 
         /// <summary>
@@ -91,8 +107,10 @@ namespace LocalRAG
             if (string.IsNullOrWhiteSpace(s))
                 return Array.Empty<int>();
 
-            return s.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                    .Select(int.Parse)
+            // A malformed stored key yields no ids for that level instead of throwing (C1 #9).
+            return s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Where(p => int.TryParse(p, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out _))
+                    .Select(p => int.Parse(p, System.Globalization.CultureInfo.InvariantCulture))
                     .ToArray();
         }
     }

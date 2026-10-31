@@ -32,9 +32,9 @@ namespace LocalRAG
         /// 24-hour half-life: a DCN referenced now scores 1.0;
         /// one referenced 24 hours ago scores ~0.37; 48 hours ago ~0.14.
         /// </summary>
-        public double ComputeRecencyWeight()
+        public double ComputeRecencyWeight(DateTime? nowUtc = null)
         {
-            var age = DateTime.UtcNow - LastReferencedUtc;
+            var age = (nowUtc ?? DateTime.UtcNow) - LastReferencedUtc;
             return Math.Exp(-age.TotalHours / 24.0);
         }
 
@@ -42,9 +42,9 @@ namespace LocalRAG
         /// Updates the last-referenced timestamp to now.
         /// Call when a new message references this DCN.
         /// </summary>
-        public void TouchReference()
+        public void TouchReference(DateTime? nowUtc = null)
         {
-            LastReferencedUtc = DateTime.UtcNow;
+            LastReferencedUtc = nowUtc ?? DateTime.UtcNow;
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] DCN > TouchReference: DCN {DcnId} updated to {LastReferencedUtc:HH:mm:ss.fff}");
         }
 
