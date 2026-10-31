@@ -224,9 +224,10 @@ namespace LocalRAG
             var header = BuildCandidateHeader(candidates, offerMore: !more, note: note);
 
             // Phase 1 audit: the ids that were offered.
-            await db.UpdateRagCandidatesSurfacedAsync(requestId, candidateIds);
             trace.DcsBoostedIds = trace.Proposed.Where(p => p.DcsBoosted).Select(p => p.Id).ToList();
-            await db.UpdateRagElectionLogAsync(requestId, trace);
+            bool audited = await TryAuditAsync(async () =>
+                await db.UpdateRagCandidatesSurfacedAsync(requestId, candidateIds)
+                & await db.UpdateRagElectionLogAsync(requestId, trace));
 
             return new JObject
             {
@@ -242,8 +243,24 @@ namespace LocalRAG
                 })),
                 ["header"] = header,
                 ["moreAvailable"] = !more,
-                ["dcsQueryDcnId"] = trace.DcsQueryDcnId
+                ["dcsQueryDcnId"] = trace.DcsQueryDcnId,
+                ["auditRecorded"] = audited
             };
+        }
+
+        /// <summary>
+        /// Runs the audit writes. They are a record of the run, not part of its answer: a missing row or a database error
+        /// returns false (reported to the caller as auditRecorded) instead of failing a search or retrieval whose
+        /// result is already computed (C1 #5).
+        /// </summary>
+        private static async Task<bool> TryAuditAsync(Func<Task<bool>> write)
+        {
+            try { return await write(); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[DCS] Audit write failed: {ex.Message}");
+                return false;
+            }
         }
 
         // ── retrieve (Layers 2-3, 5) ─────────────────────────────────────────
@@ -302,8 +319,9 @@ namespace LocalRAG
             trace.InjectedChars = context.Length;
             trace.Outcome = electedChunks.Count > 0 ? "elected"
                 : rawIds.Count > 0 ? "rejected-retry" : "answered-directly";
-            await db.UpdateRagEntriesElectedAsync(requestId, electedHashes);
-            await db.UpdateRagElectionLogAsync(requestId, trace);
+            bool audited = await TryAuditAsync(async () =>
+                await db.UpdateRagEntriesElectedAsync(requestId, electedHashes)
+                & await db.UpdateRagElectionLogAsync(requestId, trace));
 
             Debug.WriteLine($"[DCS {DateTime.Now:HH:mm:ss.fff}] Pipeline > retrieve requestId={requestId} elected=[{string.Join(", ", electedIds)}] rejected=[{string.Join(", ", rejectedIds)}] outcome={trace.Outcome}");
 
@@ -322,7 +340,8 @@ namespace LocalRAG
                     ["toolResponse"] = c.ToolUseTextResponse
                 })),
                 ["context"] = context,
-                ["tags"] = string.Concat(electedHashes.Select(h => $" [RAG:{h}]"))
+                ["tags"] = string.Concat(electedHashes.Select(h => $" [RAG:{h}]")),
+                ["auditRecorded"] = audited
             };
             if (trace.Outcome == "rejected-retry")
                 result["note"] = "No additional context is available for this request. Answer directly; do not ask to retrieve anything.";

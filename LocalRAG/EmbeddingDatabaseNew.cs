@@ -428,7 +428,7 @@ END;
         #region Connection Management
 
         private string GetConnectionString() =>
-            $"Data Source={_config.DatabasePath};Pooling=True;Cache=Shared";
+            $"Data Source={_config.DatabasePath};Pooling=True";
 
         private async Task<SqliteConnection> GetConnectionAsync()
         {
@@ -792,100 +792,78 @@ END;
         /// Records the IDs of every candidate summary that was offered to the model.
         /// Stored in MetaData JSON only; never enters the messages array.
         /// </summary>
-        public async Task UpdateRagCandidatesSurfacedAsync(string requestId, List<int> candidateIds)
-        {
-            if (string.IsNullOrEmpty(requestId)) return;
-
-            using var connection = await GetConnectionAsync();
-
-            // Read current MetaData
-            const string readQuery = "SELECT MetaData FROM embeddings WHERE RequestID = @RequestID";
-            using var readCmd = new SqliteCommand(readQuery, connection);
-            readCmd.Parameters.AddWithValue("@RequestID", requestId);
-            // DBNull (NULL MetaData) or null (no such row) both read back as a null string.
-            var raw = (await readCmd.ExecuteScalarAsync()) as string;
-
-            var meta = string.IsNullOrWhiteSpace(raw)
-                ? new Dictionary<string, object?>()
-                : Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object?>>(raw)
-                  ?? new Dictionary<string, object?>();
-
-            meta["RagCandidatesSurfaced"] = candidateIds;
-
-            const string writeQuery = "UPDATE embeddings SET MetaData = @MetaData WHERE RequestID = @RequestID";
-            using var writeCmd = new SqliteCommand(writeQuery, connection);
-            writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
-            writeCmd.Parameters.AddWithValue("@RequestID", requestId);
-            if (await writeCmd.ExecuteNonQueryAsync() == 0)
-                LogMessage($"RAG audit not recorded: no row with RequestID '{requestId}'.");
-
-            InvalidateCache(requestId);
-        }
+        public Task<bool> UpdateRagCandidatesSurfacedAsync(string requestId, List<int> candidateIds) =>
+            UpdateMetaKeyAsync(requestId, "RagCandidatesSurfaced", candidateIds, "RAG audit")
+        ;
 
         /// <summary>
         /// EE-RAG Phase 2 audit — called after the final inference call.
         /// Records the 8-hex hashes of the chunks the model actually elected to use.
         /// Stored in MetaData JSON only; never enters the messages array.
         /// </summary>
-        public async Task UpdateRagEntriesElectedAsync(string requestId, List<string> electedHashes)
-        {
-            if (string.IsNullOrEmpty(requestId)) return;
-
-            using var connection = await GetConnectionAsync();
-
-            const string readQuery = "SELECT MetaData FROM embeddings WHERE RequestID = @RequestID";
-            using var readCmd = new SqliteCommand(readQuery, connection);
-            readCmd.Parameters.AddWithValue("@RequestID", requestId);
-            var raw = (await readCmd.ExecuteScalarAsync()) as string;
-
-            var meta = string.IsNullOrWhiteSpace(raw)
-                ? new Dictionary<string, object?>()
-                : Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object?>>(raw)
-                  ?? new Dictionary<string, object?>();
-
-            meta["RagEntriesElected"] = electedHashes;
-
-            const string writeQuery = "UPDATE embeddings SET MetaData = @MetaData WHERE RequestID = @RequestID";
-            using var writeCmd = new SqliteCommand(writeQuery, connection);
-            writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
-            writeCmd.Parameters.AddWithValue("@RequestID", requestId);
-            if (await writeCmd.ExecuteNonQueryAsync() == 0)
-                LogMessage($"RAG audit not recorded: no row with RequestID '{requestId}'.");
-
-            InvalidateCache(requestId);
-        }
+        public Task<bool> UpdateRagEntriesElectedAsync(string requestId, List<string> electedHashes) =>
+            UpdateMetaKeyAsync(requestId, "RagEntriesElected", electedHashes, "RAG audit")
+        ;
 
         /// <summary>
         /// Stores the full election record (what was proposed, the model's replies, what was chosen
         /// and injected) under MetaData["RagElectionLog"] so a reviewer, human or AI, can judge it
         /// from the whole retrieval and not just the summaries. Replaces any earlier record.
         /// </summary>
-        public async Task UpdateRagElectionLogAsync(string requestId, ElectionTrace trace)
+        public Task<bool> UpdateRagElectionLogAsync(string requestId, ElectionTrace trace) =>
+            UpdateMetaKeyAsync(requestId, "RagElectionLog", trace, "RAG election log")
+        ;
+
+        /// <summary>
+        /// Sets one key in a row's MetaData JSON. The read and the write are one immediate transaction (two audit writes to
+        /// the same row cannot overwrite each other's key) and a busy or locked database is retried like the update path.
+        /// Returns false, and logs, when no row has the RequestID: the audit was not recorded (C1 #5).
+        /// </summary>
+        private async Task<bool> UpdateMetaKeyAsync(string requestId, string key, object? value, string what)
         {
-            if (string.IsNullOrEmpty(requestId)) return;
+            if (string.IsNullOrEmpty(requestId)) return false;
 
-            using var connection = await GetConnectionAsync();
+            int retryCount = 0;
+            while (true)
+            {
+                try
+                {
+                    using var connection = await GetConnectionAsync();
+                    using var tx = connection.BeginTransaction(deferred: false);
 
-            const string readQuery = "SELECT MetaData FROM embeddings WHERE RequestID = @RequestID";
-            using var readCmd = new SqliteCommand(readQuery, connection);
-            readCmd.Parameters.AddWithValue("@RequestID", requestId);
-            var raw = (await readCmd.ExecuteScalarAsync()) as string;
+                    using var readCmd = new SqliteCommand("SELECT MetaData FROM embeddings WHERE RequestID = @RequestID", connection, tx);
+                    readCmd.Parameters.AddWithValue("@RequestID", requestId);
+                    // DBNull (NULL MetaData) or null (no such row) both read back as a null string.
+                    var raw = (await readCmd.ExecuteScalarAsync()) as string;
 
-            var meta = string.IsNullOrWhiteSpace(raw)
-                ? new Dictionary<string, object?>()
-                : Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object?>>(raw)
-                  ?? new Dictionary<string, object?>();
+                    var meta = string.IsNullOrWhiteSpace(raw)
+                        ? new Dictionary<string, object?>()
+                        : Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object?>>(raw)
+                          ?? new Dictionary<string, object?>();
+                    meta[key] = value;
 
-            meta["RagElectionLog"] = trace;
+                    using var writeCmd = new SqliteCommand("UPDATE embeddings SET MetaData = @MetaData WHERE RequestID = @RequestID", connection, tx);
+                    writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
+                    writeCmd.Parameters.AddWithValue("@RequestID", requestId);
+                    int rows = await writeCmd.ExecuteNonQueryAsync();
+                    tx.Commit();
 
-            const string writeQuery = "UPDATE embeddings SET MetaData = @MetaData WHERE RequestID = @RequestID";
-            using var writeCmd = new SqliteCommand(writeQuery, connection);
-            writeCmd.Parameters.AddWithValue("@MetaData", Newtonsoft.Json.JsonConvert.SerializeObject(meta));
-            writeCmd.Parameters.AddWithValue("@RequestID", requestId);
-            if (await writeCmd.ExecuteNonQueryAsync() == 0)
-                LogMessage($"RAG election log not recorded: no row with RequestID '{requestId}'.");
-
-            InvalidateCache(requestId);
+                    InvalidateCache(requestId);
+                    if (rows == 0)
+                    {
+                        LogMessage($"{what} not recorded: no row with RequestID '{requestId}'.");
+                        return false;
+                    }
+                    return true;
+                }
+                catch (SqliteException ex) when (
+                    (ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6) && // SQLITE_BUSY / SQLITE_LOCKED
+                    retryCount < _config.MaxRetryAttempts)
+                {
+                    retryCount++;
+                    await Task.Delay(_config.RetryDelayMs * (int)Math.Pow(2, retryCount - 1));
+                }
+            }
         }
 
         public async Task<List<(string request, string textResponse, string toolUseTextResponse, string toolContent, string toolResult, string requestID)>>
@@ -1884,7 +1862,7 @@ WHERE RequestID = @RequestID";
             // tokens use prefix matching (term*); tokens with special chars keep the
             // quoted-exact form (prefix '*' on those breaks the FTS5 parser).
             var ftsQuery = string.Join(" OR ", searchWords.Select(w =>
-                fuzzy && w.All(char.IsLetterOrDigit) ? $"{w}*" : $"\"{w}\""));
+                fuzzy && w.All(char.IsLetterOrDigit) ? $"{w}*" : $"\"{w.Replace("\"", "\"\"")}\""));
 
             // Optional trigram candidate recall: when fuzzy is active and configured, also
             // pull candidates whose text shares character trigrams with the query words, so
