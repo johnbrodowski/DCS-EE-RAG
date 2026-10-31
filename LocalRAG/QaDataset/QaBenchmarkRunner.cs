@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 
 namespace LocalRAG.QaDataset
 {
@@ -46,6 +46,7 @@ namespace LocalRAG.QaDataset
                 Total = items.Count
             });
 
+            var consecutiveErrors = 0;
             for (int i = 0; i < items.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -76,6 +77,7 @@ namespace LocalRAG.QaDataset
                 catch (Exception ex)
                 {
                     modelResponse = $"ERROR: {ex.Message}";
+                    outcome = QaOutcome.Error;
                 }
 
                 var result = new QaRunResult
@@ -97,8 +99,11 @@ namespace LocalRAG.QaDataset
                     case QaOutcome.Correct:         report.Correct++;         break;
                     case QaOutcome.PossiblyCorrect: report.PossiblyCorrect++; break;
                     case QaOutcome.DefinitelyWrong: report.DefinitelyWrong++; break;
+                    case QaOutcome.Error:           report.Errors++;          break;
                     default:                        report.Indeterminate++;   break;
                 }
+
+                consecutiveErrors = outcome == QaOutcome.Error ? consecutiveErrors + 1 : 0;
 
                 // Emit structured progress with running counts after every answer
                 progress?.Report(new BenchmarkProgressUpdate
@@ -109,9 +114,20 @@ namespace LocalRAG.QaDataset
                     Correct          = report.Correct,
                     PossiblyCorrect  = report.PossiblyCorrect,
                     DefinitelyWrong  = report.DefinitelyWrong,
-                    Indeterminate    = report.Indeterminate
+                    Indeterminate    = report.Indeterminate,
+                    Errors           = report.Errors
                 });
+
+                // A bad key, a rate limit or a context overflow fails every remaining question the same way; stop
+                // instead of producing a full report of errors.
+                if (opts.MaxConsecutiveErrors > 0 && consecutiveErrors >= opts.MaxConsecutiveErrors)
+                {
+                    report.AbortReason = $"{consecutiveErrors} model calls failed in a row (last: {modelResponse})";
+                    break;
+                }
             }
+
+            report.TotalRun = report.Results.Count;
 
             sw.Stop();
             report.Duration = sw.Elapsed;
@@ -126,25 +142,33 @@ namespace LocalRAG.QaDataset
         /// 2. def_incorrect_predictions           → DefinitelyWrong
         /// 3. poss_correct_predictions            → PossiblyCorrect
         /// 4. no match                            → Indeterminate
+        /// Matching is on whole words.
         /// </summary>
         public static (QaOutcome Outcome, string? MatchedAnswer) EvaluateAnswer(
             string response, QaDatasetItem item)
         {
-            var lower = response.ToLowerInvariant();
-
             foreach (var ans in item.AnswerAndDefCorrectPredictions)
-                if (!string.IsNullOrWhiteSpace(ans) && lower.Contains(ans.ToLowerInvariant()))
+                if (ContainsAnswer(response, ans))
                     return (QaOutcome.Correct, ans);
 
             foreach (var ans in item.DefIncorrectPredictions)
-                if (!string.IsNullOrWhiteSpace(ans) && lower.Contains(ans.ToLowerInvariant()))
+                if (ContainsAnswer(response, ans))
                     return (QaOutcome.DefinitelyWrong, ans);
 
             foreach (var ans in item.PossCorrectPredictions)
-                if (!string.IsNullOrWhiteSpace(ans) && lower.Contains(ans.ToLowerInvariant()))
+                if (ContainsAnswer(response, ans))
                     return (QaOutcome.PossiblyCorrect, ans);
 
             return (QaOutcome.Indeterminate, null);
+        }
+
+        /// <summary>Whole-word, case-insensitive match, so an answer such as "a", "no" or "1" is not found inside "banana", "know" or "2019".</summary>
+        private static bool ContainsAnswer(string response, string? answer)
+        {
+            if (string.IsNullOrWhiteSpace(answer)) return false;
+            var pattern = @"(?<![\p{L}\p{N}])" + System.Text.RegularExpressions.Regex.Escape(answer.Trim()) + @"(?![\p{L}\p{N}])";
+            return System.Text.RegularExpressions.Regex.IsMatch(response, pattern,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
         }
 
         // ── Prompt construction ───────────────────────────────────────────────

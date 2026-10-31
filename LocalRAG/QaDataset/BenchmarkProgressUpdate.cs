@@ -1,4 +1,4 @@
-namespace LocalRAG.QaDataset
+﻿namespace LocalRAG.QaDataset
 {
     /// <summary>
     /// Structured progress update emitted after each question completes during a benchmark run.
@@ -19,6 +19,7 @@ namespace LocalRAG.QaDataset
         public int PossiblyCorrect { get; set; }
         public int DefinitelyWrong { get; set; }
         public int Indeterminate { get; set; }
+        public int Errors { get; set; }
 
         // Computed rates (0–100)
         public double CorrectRate        => Done == 0 ? 0 : (double)Correct        / Done * 100;

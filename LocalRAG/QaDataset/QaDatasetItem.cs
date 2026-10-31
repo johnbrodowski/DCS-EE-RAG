@@ -1,4 +1,4 @@
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 
 namespace LocalRAG.QaDataset
 {
@@ -52,7 +52,9 @@ namespace LocalRAG.QaDataset
         Correct,
         PossiblyCorrect,
         DefinitelyWrong,
-        Indeterminate
+        Indeterminate,
+        /// <summary>The model call failed; the question was not answered, so it counts toward no accuracy figure.</summary>
+        Error
     }
 
     public class QaBenchmarkOptions
@@ -65,5 +67,7 @@ namespace LocalRAG.QaDataset
         /// <summary>If true and embeddings are available, inject similar Q&amp;A pairs as context.</summary>
         public bool UseRagContext { get; set; } = true;
         public int SimilarContextCount { get; set; } = 3;
+        /// <summary>The run stops after this many failed model calls in a row (a bad key, a rate limit, a context overflow). 0 never stops it.</summary>
+        public int MaxConsecutiveErrors { get; set; } = 5;
     }
 }
