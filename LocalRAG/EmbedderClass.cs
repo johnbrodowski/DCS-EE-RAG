@@ -77,6 +77,14 @@ namespace LocalRAG
             }
         }
 
+        /// <summary>
+        /// Identifies the model and the settings that change the vectors it produces (model file, vocabulary, vector size,
+        /// sequence length, casing, stop words). A database remembers it, so vectors from two models are never mixed (G4-10).
+        /// </summary>
+        public string ModelFingerprint =>
+            $"{Path.GetFileName(_config.ModelPath)}|{new FileInfo(_config.ModelPath).Length}|{new FileInfo(_config.VocabularyPath).Length}" +
+            $"|{_hiddenDim}|{_config.MaxSequenceLength}|{_config.LowercaseInput}|{_config.RemoveStopWords}";
+
         private int GetHiddenDimensionFromModel()
         {
             // Try to get hidden dimension from output metadata

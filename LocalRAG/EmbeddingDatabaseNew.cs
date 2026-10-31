@@ -137,6 +137,62 @@ namespace LocalRAG
         // Completes when tables exist and in-memory indexes have been warmed from disk.
         private readonly Task _initTask;
 
+        /// <summary>
+        /// Non-null when the embeddings stored in this database were made by a different model (or vector-changing
+        /// settings) than the one now loaded. Cosine similarity between the two is meaningless (a different size scores
+        /// 0, the same size scores arbitrary numbers), so searching, embedding new text and a "missing only" backfill are
+        /// refused until <c>BackfillEmbeddingsAsync("all")</c> has re-embedded every record (G4-10).
+        /// </summary>
+        public string? EmbeddingModelMismatch { get; private set; }
+
+        private void ThrowIfEmbeddingModelMismatch()
+        {
+            if (EmbeddingModelMismatch is { } message) throw new InvalidOperationException(message);
+        }
+
+        private async Task<string?> GetMetaAsync(string key)
+        {
+            using var connection = await GetConnectionAsync();
+            using var cmd = new SqliteCommand("SELECT Value FROM rag_meta WHERE Key = @k", connection);
+            cmd.Parameters.AddWithValue("@k", key);
+            return await cmd.ExecuteScalarAsync() as string;
+        }
+
+        private async Task SetMetaAsync(string key, string value)
+        {
+            using var connection = await GetConnectionAsync();
+            using var cmd = new SqliteCommand(
+                "INSERT INTO rag_meta(Key, Value) VALUES(@k, @v) ON CONFLICT(Key) DO UPDATE SET Value = @v", connection);
+            cmd.Parameters.AddWithValue("@k", key);
+            cmd.Parameters.AddWithValue("@v", value);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        private async Task CheckEmbeddingModelAsync()
+        {
+            var current = _embedder.ModelFingerprint;
+            var stored = await GetMetaAsync("embedding_model");
+
+            bool hasEmbeddings;
+            using (var connection = await GetConnectionAsync())
+            using (var cmd = new SqliteCommand(
+                "SELECT EXISTS(SELECT 1 FROM embeddings WHERE RequestEmbedding IS NOT NULL OR RequestEmbeddingList IS NOT NULL " +
+                "OR TextResponseEmbedding IS NOT NULL OR ToolUseTextResponseEmbedding IS NOT NULL OR SummaryEmbedding IS NOT NULL)", connection))
+                hasEmbeddings = Convert.ToInt64(await cmd.ExecuteScalarAsync()) == 1;
+
+            // No record yet (a new database) or no embedding to compare with: nothing can be mixed, so adopt this model.
+            if (stored == null || stored == current || !hasEmbeddings)
+            {
+                if (stored != current) await SetMetaAsync("embedding_model", current);
+                return;
+            }
+
+            EmbeddingModelMismatch =
+                $"This database's embeddings were made by a different model or settings (stored: {stored}; loaded: {current}). " +
+                "Run BackfillEmbeddingsAsync(\"all\") to re-embed every record with the loaded model.";
+            LogMessage(EmbeddingModelMismatch);
+        }
+
         private long _embeddingFailures;
 
         /// <summary>Embeddings that could not be produced (failed or timed out) since this object was created. Those rows are stored without the vector.</summary>
@@ -157,9 +213,57 @@ namespace LocalRAG
         {
             await CreateTableAsync();
             await InitializeOrdinalsAsync();
+            await CheckEmbeddingModelAsync();
             // Rebuild the in-memory search indexes from any embeddings already on disk so
             // vector/LSH search works immediately after a restart (and resumes a corpus).
             await WarmIndexesFromDatabaseAsync();
+        }
+
+        /// <summary>Bump when the table layout changes and add the new column to <see cref="AddableColumns"/>.</summary>
+        private const int SchemaVersion = 1;
+
+        // Every column except Id and RequestID (which a table cannot gain after creation). A database made by an earlier
+        // release lacks the ones added since; they are added on open instead of failing later with "no such column".
+        private static readonly (string Name, string Ddl)[] AddableColumns =
+        {
+            ("UserMessageType", "TEXT"), ("AssistantMessageType", "TEXT"), ("Rating", "INTEGER DEFAULT 0"), ("MetaData", "TEXT"),
+            ("Request", "TEXT"), ("TextResponse", "TEXT"), ("ToolUseTextResponse", "TEXT"), ("ToolName", "TEXT"),
+            ("ToolContent", "TEXT"), ("ToolResult", "TEXT"), ("Code", "TEXT"), ("Summary", "TEXT"), ("Comment", "TEXT"),
+            ("Errors", "TEXT"), ("RequestStatus", "TEXT"), ("RequestEmbedding", "TEXT"), ("TextResponseEmbedding", "TEXT"),
+            ("ToolUseTextResponseEmbedding", "TEXT"), ("SummaryEmbedding", "TEXT"), ("RequestEmbeddingList", "TEXT"),
+            ("TextResponseEmbeddingList", "TEXT"), ("ToolUseTextResponseEmbeddingList", "TEXT"),
+            ("SummaryEmbeddingList", "TEXT"), ("Timestamp", "DATETIME") // no CURRENT_TIMESTAMP default: ALTER cannot add one
+        };
+
+        private async Task MigrateSchemaAsync(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            long version;
+            using (var cmd = new SqliteCommand("PRAGMA user_version", connection, transaction))
+                version = Convert.ToInt64(await cmd.ExecuteScalarAsync());
+            if (version > SchemaVersion)
+                throw new InvalidOperationException(
+                    $"The database was written by a newer version of this library (schema {version}, this one understands {SchemaVersion}).");
+
+            var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var cmd = new SqliteCommand("PRAGMA table_info(embeddings)", connection, transaction))
+            using (var reader = await cmd.ExecuteReaderAsync())
+                while (await reader.ReadAsync())
+                    existing.Add(reader.GetString(1));
+
+            if (existing.Count > 0) // a fresh database has no table yet; CREATE TABLE below makes every column
+            {
+                foreach (var (name, ddl) in AddableColumns)
+                {
+                    if (existing.Contains(name)) continue;
+                    using var alter = new SqliteCommand($"ALTER TABLE embeddings ADD COLUMN {name} {ddl}", connection, transaction);
+                    await alter.ExecuteNonQueryAsync();
+                    LogMessage($"Database upgraded: added column {name}.");
+                }
+            }
+
+            if (version < SchemaVersion)
+                using (var cmd = new SqliteCommand($"PRAGMA user_version = {SchemaVersion}", connection, transaction))
+                    await cmd.ExecuteNonQueryAsync();
         }
 
         private async Task CreateTableAsync()
@@ -198,6 +302,11 @@ CREATE TABLE IF NOT EXISTS embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_embeddings_requestid ON embeddings(RequestID);
 CREATE INDEX IF NOT EXISTS idx_embeddings_timestamp ON embeddings(Timestamp);
+
+CREATE TABLE IF NOT EXISTS rag_meta (
+    Key TEXT PRIMARY KEY,
+    Value TEXT
+);
 ";
 
             // FTS5 virtual table for full-text search (shadows main table). The porter tokenizer
@@ -274,6 +383,8 @@ END;
 
             try
             {
+                await MigrateSchemaAsync(connection, transaction);
+
                 using (var cmd = new SqliteCommand(createMainTable, connection, transaction))
                     await cmd.ExecuteNonQueryAsync();
 
@@ -416,7 +527,8 @@ END;
                 }
                 catch (IndexOutOfRangeException)
                 {
-                    LogMessage($"Column {field.Key} not found in database");
+                    // Left at its default the ordinal would be 0, so this field would silently read column 0.
+                    throw new InvalidOperationException($"The embeddings table has no column {field.Key}; the database layout does not match this version.");
                 }
             }
 
@@ -576,6 +688,7 @@ END;
             // A search issued during start-up used to see a half-filled index, and a failed warm-up left it empty
             // with nothing said. Wait for it; a failure is thrown here instead of returning BM25-only hits (C1 #5).
             await EnsureReadyAsync();
+            ThrowIfEmbeddingModelMismatch();
 
             var mode = _config.FuzzyLexicalMode;
             // Whether the first pass uses fuzzy matching: forced by caller, or Always mode.
@@ -929,6 +1042,10 @@ END;
 
             bool replaceExisting = mode.ToLower() is "all" or "both" or "replace";
 
+            // Filling only the gaps under another model would put its vectors next to the stored ones; only a full
+            // re-embed ("all") may change the model (G4-10).
+            if (!replaceExisting) ThrowIfEmbeddingModelMismatch();
+
             LogMessage($"Starting embedding backfill - Mode: {mode}, ReplaceExisting: {replaceExisting}");
 
             // Get all records that need processing
@@ -947,13 +1064,23 @@ END;
 
                 try
                 {
-                    var updated = await RegenerateEmbeddingsForRecordAsync(record, replaceExisting);
+                    var (updated, incomplete) = await RegenerateEmbeddingsForRecordAsync(record, replaceExisting);
 
                     if (updated)
                     {
-                        result.SuccessCount++;
                         // Clear LSH tables for this record and re-add
                         await RebuildLSHForRecordAsync(record.Id);
+                    }
+
+                    if (incomplete)
+                    {
+                        // Some wanted vector did not come back, so the row still holds the old one for it.
+                        result.FailedCount++;
+                        result.Errors.Add($"RequestID {record.RequestID}: some embeddings could not be regenerated; the old ones were kept.");
+                    }
+                    else if (updated)
+                    {
+                        result.SuccessCount++;
                     }
                     else
                     {
@@ -982,6 +1109,14 @@ END;
 
             LogMessage($"Backfill complete - Processed: {result.ProcessedCount}, Success: {result.SuccessCount}, " +
                       $"Failed: {result.FailedCount}, Skipped: {result.SkippedCount}, Time: {result.ElapsedTime}");
+
+            // The database now belongs to the loaded model only when every record was re-embedded: a cancelled or partly
+            // failed run leaves a mix, which stays flagged (and refused) instead of passing as migrated (G4-10).
+            if (replaceExisting && !result.WasCancelled && result.FailedCount == 0)
+            {
+                await SetMetaAsync("embedding_model", _embedder.ModelFingerprint);
+                EmbeddingModelMismatch = null;
+            }
 
             return result;
         }
@@ -1018,7 +1153,7 @@ END;
         /// <summary>
         /// Regenerates embeddings for a single record
         /// </summary>
-        private async Task<bool> RegenerateEmbeddingsForRecordAsync(FeedbackDatabaseValues record, bool replaceExisting)
+        private async Task<(bool Updated, bool Incomplete)> RegenerateEmbeddingsForRecordAsync(FeedbackDatabaseValues record, bool replaceExisting)
         {
             bool anyUpdated = false;
             var updates = new Dictionary<string, string>();
@@ -1112,6 +1247,19 @@ END;
                 }
             }
 
+            // Anything wanted that did not come back leaves the OLD vector in the row (a mix of models after a replace).
+            bool incomplete = false;
+            void Want(string? text, bool wanted, string column)
+            {
+                if (!string.IsNullOrEmpty(text) && wanted &&
+                    (!updates.ContainsKey(column) || !updates.ContainsKey(column + "List")))
+                    incomplete = true;
+            }
+            Want(record.Request, replaceExisting || record.RequestEmbedding == null, "RequestEmbedding");
+            Want(record.TextResponse, replaceExisting || record.TextResponseEmbedding == null, "TextResponseEmbedding");
+            Want(record.ToolUseTextResponse, replaceExisting || record.ToolUseTextResponseEmbedding == null, "ToolUseTextResponseEmbedding");
+            Want(record.Summary, replaceExisting || record.SummaryEmbedding == null, "SummaryEmbedding");
+
             // Apply updates if any
             if (updates.Count > 0)
             {
@@ -1124,8 +1272,8 @@ END;
                 Debug.WriteLine($"  -> No updates to save");
             }
 
-            Debug.WriteLine($"  -> Record complete. anyUpdated={anyUpdated}");
-            return anyUpdated;
+            Debug.WriteLine($"  -> Record complete. anyUpdated={anyUpdated} incomplete={incomplete}");
+            return (anyUpdated, incomplete);
         }
 
         /// <summary>
@@ -2160,6 +2308,7 @@ LIMIT 100";
 
         private async Task<FeedbackDatabaseValues> EmbedResponse(FeedbackDatabaseValues data)
         {
+            ThrowIfEmbeddingModelMismatch(); // would add vectors of the loaded model next to the stored ones (G4-10)
             var tasks = new List<Task>();
             var requested = new List<(string Name, Func<bool> Arrived)>();
             bool abandoned = false; // set on timeout: a late result must not write into a row that is already inserted
