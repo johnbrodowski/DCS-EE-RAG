@@ -161,6 +161,25 @@ var config = new RAGConfiguration
 };
 ```
 
+### Embeddings on a GPU machine (optional)
+
+Embeddings can come from an OpenAI-compatible endpoint instead of the local ONNX model, for example LM Studio on a machine with a GPU. Load an embedding model there (a GGUF build of the same GTE-small gives vectors close to the local ones; a larger model such as `gte-base` or `bge-base-en-v1.5` also works) and point the system at it:
+
+```csharp
+var config = new RAGConfiguration
+{
+    RemoteEmbeddingUrl   = "http://gpu-box:1234/v1",
+    RemoteEmbeddingModel = "emb"      // the model identifier LM Studio serves
+};
+```
+
+Or set `DCS_EMBEDDING_URL`, `DCS_EMBEDDING_MODEL` (default `emb`) and `DCS_EMBEDDING_API_KEY` (only if the endpoint needs one).
+
+- The endpoint is tried once when the embedder is created (`RemoteEmbeddingProbeTimeoutMs`, 3 s). If it answers, it makes every vector and the local model is not loaded. If it does not, the local ONNX model is used. The choice is not revisited mid-run, so one run never mixes two models.
+- The vector size is read from the first reply, so any dimension works.
+- A database remembers which model made its vectors. Moving between the endpoint and the local model (or between two endpoint models) sets `EmbeddingModelMismatch` until `BackfillEmbeddingsAsync("all")` re-embeds everything.
+- Models that expect a query/document prefix (`nomic-embed-text`, `e5`) are not given one.
+
 ### Build
 
 ```bash
@@ -265,6 +284,13 @@ public class RAGConfiguration
     string DatabasePath          // SQLite DB path (created if missing)
     string ModelPath             // ONNX BERT model (.onnx)
     string VocabularyPath        // BERT vocab file (vocab.txt)
+
+    // Remote embeddings (optional; see "Embeddings on a GPU machine")
+    string? RemoteEmbeddingUrl            // OpenAI-compatible base URL; null = local model (env DCS_EMBEDDING_URL)
+    string  RemoteEmbeddingModel          // Model id sent to the endpoint (default: "emb")
+    string? RemoteEmbeddingApiKey         // Bearer token, if needed
+    int     RemoteEmbeddingProbeTimeoutMs // Start-up check before falling back (default: 3000)
+    int     RemoteEmbeddingTimeoutSeconds // Per-request timeout (default: 60)
 
     // Chunking
     int    MaxSequenceLength     // BERT max input length (default: 128)

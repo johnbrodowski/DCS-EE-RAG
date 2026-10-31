@@ -55,6 +55,23 @@ namespace LocalRAG
         public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("model", "vocab.txt"));
 
         /// <summary>
+        /// Base URL of an OpenAI-compatible embeddings endpoint, e.g. "http://gpu-box:1234/v1" (LM Studio). When set and the
+        /// endpoint answers at start-up, it makes every vector and the local ONNX model is not loaded. When it does not answer,
+        /// the local model (<see cref="ModelPath"/>) is used. Null (the default) always uses the local model. The choice is
+        /// made once per embedder, so a run never mixes the two. Vectors from the two are different and are kept apart by
+        /// the database model check.
+        /// </summary>
+        public string? RemoteEmbeddingUrl { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_URL");
+        /// <summary>Model identifier sent to the endpoint.</summary>
+        public string RemoteEmbeddingModel { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_MODEL") ?? "emb";
+        /// <summary>Bearer token for the endpoint, if it needs one (LM Studio does not).</summary>
+        public string? RemoteEmbeddingApiKey { get; set; } = Environment.GetEnvironmentVariable("DCS_EMBEDDING_API_KEY");
+        /// <summary>How long the start-up check waits before the local model is used instead.</summary>
+        public int RemoteEmbeddingProbeTimeoutMs { get; set; } = 3000;
+        /// <summary>Timeout of each embedding request once the endpoint is in use.</summary>
+        public int RemoteEmbeddingTimeoutSeconds { get; set; } = 60;
+
+        /// <summary>
         /// Path to the BERT vocabulary file (vocab.txt). Should match the BERT model being used.
         /// </summary>
         //public string VocabularyPath { get; set; } = GetAppPath(Path.Combine("Vocabularies", "base_uncased_large.txt"));

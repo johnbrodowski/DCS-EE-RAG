@@ -9,8 +9,9 @@ namespace LocalRAG
 {
     public class EmbedderClassNew : IDisposable
     {
-        private readonly BertTokenizer _tokenizer;
-        private readonly InferenceSession _session;
+        private readonly BertTokenizer? _tokenizer;      // null while the remote endpoint makes the vectors
+        private readonly InferenceSession? _session;      // null while the remote endpoint makes the vectors
+        private readonly RemoteEmbeddingClient? _remote;
         private readonly MemoryHashIndex _memoryIndex;
         private readonly RAGConfiguration _config;
         private readonly int _hiddenDim;
@@ -27,63 +28,91 @@ namespace LocalRAG
         public EmbedderClassNew(RAGConfiguration? config = null)
         {
             _config = config ?? throw new ArgumentNullException(nameof(config));
-            _tokenizer = new BertTokenizer();
 
-            using var sessionOptions = new SessionOptions
+            // A GPU endpoint, when one is configured and answering, makes every vector. The choice is made once so a
+            // run never mixes its vectors with the local model's.
+            if (!string.IsNullOrWhiteSpace(_config.RemoteEmbeddingUrl))
             {
-                GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
-                InterOpNumThreads = _config.InterOpNumThreads,
-                IntraOpNumThreads = _config.IntraOpNumThreads
-            };
-
-            // Optional GPU via DirectML (any DirectX 12 GPU, including AMD). Needs the
-            // DirectML build of ONNX Runtime (build with -p:UseDirectML=true) and a model that
-            // runs on it (an fp32/fp16 export, not the int8 CPU model).
-            if (_config.GpuDeviceId is int gpu)
-            {
-                sessionOptions.EnableMemoryPattern = false;                 // DirectML requirements
-                sessionOptions.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
-                sessionOptions.AppendExecutionProvider_DML(gpu);
+                var client = new RemoteEmbeddingClient(_config);
+                if (client.ProbeAsync(_config.RemoteEmbeddingProbeTimeoutMs).GetAwaiter().GetResult())
+                    _remote = client;
+                else
+                {
+                    client.Dispose();
+                    Debug.WriteLine($"Embedding endpoint {_config.RemoteEmbeddingUrl} did not answer; using the local model.");
+                }
             }
 
-            _session = new InferenceSession(_config.ModelPath, sessionOptions);
+            if (_remote == null)
+            {
+                _tokenizer = new BertTokenizer();
+
+                using var sessionOptions = new SessionOptions
+                {
+                    GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                    InterOpNumThreads = _config.InterOpNumThreads,
+                    IntraOpNumThreads = _config.IntraOpNumThreads
+                };
+
+                // Optional GPU via DirectML (any DirectX 12 GPU, including AMD). Needs the
+                // DirectML build of ONNX Runtime (build with -p:UseDirectML=true) and a model that
+                // runs on it (an fp32/fp16 export, not the int8 CPU model).
+                if (_config.GpuDeviceId is int gpu)
+                {
+                    sessionOptions.EnableMemoryPattern = false;                 // DirectML requirements
+                    sessionOptions.ExecutionMode = ExecutionMode.ORT_SEQUENTIAL;
+                    sessionOptions.AppendExecutionProvider_DML(gpu);
+                }
+
+                _session = new InferenceSession(_config.ModelPath, sessionOptions);
+            }
 
             // A failure from here on (a missing vocabulary file, say) would leave the native session open, because the
             // constructor never returns an object to dispose.
             try
             {
+                if (_remote != null)
+                {
+                    _hiddenDim = _remote.Dimension;
+                }
+                else
+                {
+                    // Determine hidden dimension from model metadata
+                    _hiddenDim = GetHiddenDimensionFromModel();
 
-            // Determine hidden dimension from model metadata
-            _hiddenDim = GetHiddenDimensionFromModel();
+                    using var vocabReader = new StreamReader(_config.VocabularyPath);
+                    _tokenizer!.LoadVocabulary(vocabReader, convertInputToLowercase: _config.LowercaseInput);
+                }
 
-            using (var vocabReader = new StreamReader(_config.VocabularyPath))
-            {
-                _tokenizer.LoadVocabulary(vocabReader, convertInputToLowercase: _config.LowercaseInput);
-            }
+                var hashOptions = new MemoryHashOptions
+                {
+                    SimilarityThreshold = 0.5,
+                    MaxItems = 50000,
+                    HashSize = 32,
+                    NumHashFunctions = _config.NumberOfHashFunctions,
+                    NumBuckets = 256
+                };
+                _memoryIndex = new MemoryHashIndex(hashOptions);
 
-            var hashOptions = new MemoryHashOptions
-            {
-                SimilarityThreshold = 0.5,
-                MaxItems = 50000,
-                HashSize = 32,
-                NumHashFunctions = _config.NumberOfHashFunctions,
-                NumBuckets = 256
-            };
-            _memoryIndex = new MemoryHashIndex(hashOptions);
-
-            // Optional shared embedding cache (see RAGConfiguration.EmbeddingCacheDirectory). The salt makes
-            // vectors from another model or other vector-changing settings land under different keys.
-            if (!string.IsNullOrWhiteSpace(_config.EmbeddingCacheDirectory) && !_config.UseMemoryChannel)
-            {
-                _cacheDir = _config.EmbeddingCacheDirectory;
-                Directory.CreateDirectory(_cacheDir);
-                var model = new FileInfo(_config.ModelPath);
-                _cacheSalt = $"v1|{model.Name}|{model.Length}|{_config.MaxSequenceLength}|{_config.RemoveStopWords}|{_config.LowercaseInput}";
-            }
+                // Optional shared embedding cache (see RAGConfiguration.EmbeddingCacheDirectory). The salt makes
+                // vectors from another model or other vector-changing settings land under different keys.
+                if (!string.IsNullOrWhiteSpace(_config.EmbeddingCacheDirectory) && !_config.UseMemoryChannel)
+                {
+                    _cacheDir = _config.EmbeddingCacheDirectory;
+                    Directory.CreateDirectory(_cacheDir);
+                    if (_remote != null)
+                        _cacheSalt = $"v1|remote|{_remote.Endpoint}|{_remote.Model}|{_hiddenDim}|{_config.RemoveStopWords}";
+                    else
+                    {
+                        var model = new FileInfo(_config.ModelPath);
+                        _cacheSalt = $"v1|{model.Name}|{model.Length}|{_config.MaxSequenceLength}|{_config.RemoveStopWords}|{_config.LowercaseInput}";
+                    }
+                }
             }
             catch
             {
-                _session.Dispose();
+                _session?.Dispose();
+                _remote?.Dispose();
                 throw;
             }
         }
@@ -92,15 +121,16 @@ namespace LocalRAG
         /// Identifies the model and the settings that change the vectors it produces (model file, vocabulary, vector size,
         /// sequence length, casing, stop words). A database remembers it, so vectors from two models are never mixed (G4-10).
         /// </summary>
-        public string ModelFingerprint =>
-            $"{Path.GetFileName(_config.ModelPath)}|{new FileInfo(_config.ModelPath).Length}|{new FileInfo(_config.VocabularyPath).Length}" +
+        public string ModelFingerprint => _remote != null
+            ? $"remote|{_remote.Model}|{_remote.Endpoint}|{_hiddenDim}|{_config.RemoveStopWords}"
+            : $"{Path.GetFileName(_config.ModelPath)}|{new FileInfo(_config.ModelPath).Length}|{new FileInfo(_config.VocabularyPath).Length}" +
             $"|{_hiddenDim}|{_config.MaxSequenceLength}|{_config.LowercaseInput}|{_config.RemoveStopWords}";
 
         private int GetHiddenDimensionFromModel()
         {
             // Try to get hidden dimension from output metadata
             // BERT large: 1024, BERT base: 768
-            if (_session.OutputMetadata.TryGetValue("last_hidden_state", out var metadata))
+            if (_session!.OutputMetadata.TryGetValue("last_hidden_state", out var metadata))
             {
                 var dims = metadata.Dimensions;
                 if (dims != null && dims.Length >= 3)
@@ -215,7 +245,9 @@ namespace LocalRAG
                 throw new ArgumentException("Text is empty after preprocessing.", nameof(textToEmbed));
 
             // Encode to the text's real length, then pad only to PaddedLength (not always 512).
-            var (ids0, mask0, types0) = _tokenizer.Encode(text, _config.MaxSequenceLength);
+            if (_remote != null) return await ComputeRemoteAsync(new[] { text }, new[] { textToEmbed }).ContinueWith(t => t.Result[0]);
+
+            var (ids0, mask0, types0) = _tokenizer!.Encode(text, _config.MaxSequenceLength);
             int len = PaddedLength(ids0.Length);
             var inputIds = PadTo(ids0.Span, len);
             var attentionMask = PadTo(mask0.Span, len);
@@ -229,13 +261,13 @@ namespace LocalRAG
                     new DenseTensor<long>(attentionMask, new[] { 1, len }))
             };
 
-            if (_session.InputMetadata.ContainsKey("token_type_ids"))
+            if (_session!.InputMetadata.ContainsKey("token_type_ids"))
             {
                 inputData.Add(NamedOnnxValue.CreateFromTensor("token_type_ids",
                     new DenseTensor<long>(tokenTypeIds, new[] { 1, len })));
             }
 
-            using var results = await Task.Run(() => _session.Run(inputData));
+            using var results = await Task.Run(() => _session!.Run(inputData));
 
             var output = results.FirstOrDefault(r => r.Name == "last_hidden_state")
                       ?? results.FirstOrDefault();
@@ -394,11 +426,13 @@ namespace LocalRAG
             int n = processed.Count;
             if (n == 0) return new List<float[]>();
 
-            bool hasTypeIds = _session.InputMetadata.ContainsKey("token_type_ids");
+            if (_remote != null) return await ComputeRemoteAsync(processed, raw);
+
+            bool hasTypeIds = _session!.InputMetadata.ContainsKey("token_type_ids");
 
             // Encode each text to its real length; the batch is padded to its longest member.
             var encoded = processed
-                .Select(p => _tokenizer.Encode(p, _config.MaxSequenceLength))
+                .Select(p => _tokenizer!.Encode(p, _config.MaxSequenceLength))
                 .ToList();
             int seq = PaddedLength(encoded.Max(e => e.InputIds.Length));
 
@@ -425,7 +459,7 @@ namespace LocalRAG
                 inputData.Add(NamedOnnxValue.CreateFromTensor("token_type_ids",
                     new DenseTensor<long>(types!, new[] { n, seq })));
 
-            using var results = await Task.Run(() => _session.Run(inputData));
+            using var results = await Task.Run(() => _session!.Run(inputData));
 
             var output = results.FirstOrDefault(r => r.Name == "last_hidden_state")
                       ?? results.FirstOrDefault();
@@ -465,6 +499,24 @@ namespace LocalRAG
                         tags: new Dictionary<string, string> { { "text", raw[r] } });
             }
 
+            return list;
+        }
+
+        /// <summary>Embeds already-preprocessed texts through the remote endpoint, normalised like the local path.</summary>
+        private async Task<List<float[]>> ComputeRemoteAsync(IReadOnlyList<string> processed, IReadOnlyList<string> raw)
+        {
+            var vectors = await _remote!.EmbedAsync(processed);
+            var list = new List<float[]>(vectors.Count);
+            for (int r = 0; r < vectors.Count; r++)
+            {
+                var normalized = Normalize(vectors[r]);
+                list.Add(normalized);
+                if (_config.UseMemoryChannel)
+                    await _memoryIndex.AddOrUpdateAsync(
+                        id: Guid.NewGuid().ToString(),
+                        vector: normalized,
+                        tags: new Dictionary<string, string> { { "text", raw[r] } });
+            }
             return list;
         }
 
@@ -697,6 +749,7 @@ namespace LocalRAG
             if (disposing)
             {
                 _session?.Dispose();
+                _remote?.Dispose();
                 _memoryIndex?.Dispose();
             }
 
