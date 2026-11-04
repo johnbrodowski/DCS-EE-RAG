@@ -159,11 +159,13 @@ DCS-EE-RAG/
 │   ├── EmbedderClass.cs            ONNX BERT embedding generation
 │   ├── MemoryHashIndex.cs          In-memory LSH vector index
 │   ├── FeedbackDatabaseValues.cs   Database row model
+│   ├── ChatExportImporter.cs       Imports a ContextMigrate export (messages.jsonl or per-chat json) as user/assistant rows, idempotent by message id
 │   └── RAGConfiguration.cs         Centralized configuration
 ├── LocalRAG.Tests/                 xUnit test project (.NET 10)
 │   ├── DcsTests.cs                 Unit tests for all DCS components
 │   ├── EERagBenchmarkTests.cs      Pipeline and benchmark tests
 │   ├── IntegrationTests.cs         End-to-end tests requiring BERT model
+│   ├── ChatExportImporterTests.cs  Tests for the ContextMigrate chat importer
 │   ├── CosineSimilarityTests.cs
 │   ├── LSHTests.cs
 │   ├── MemoryHashIndexTests.cs
